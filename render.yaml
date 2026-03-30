@@ -1,0 +1,24 @@
+services:
+  - type: worker          # фоновый процесс (не web — боту не нужен HTTP-порт)
+    name: trade-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free            # или starter
+    envVars:
+      - key: BOT_TOKEN
+        sync: false       # вводишь вручную в Render Dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SOURCE_CHAT_ID
+        sync: false
+      - key: REPORT_CHAT_ID
+        sync: false
+      - key: DIALOG_CHAT_ID
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+    disk:
+      name: trades-db
+      mountPath: /data
+      sizeGB: 1
