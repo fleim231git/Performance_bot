@@ -22,7 +22,7 @@ DIALOG_CHAT_ID   = int(os.environ.get("DIALOG_CHAT_ID", "0"))   # чат для 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 BOT_USERNAME     = os.environ.get("BOT_USERNAME", "")           # без @, напр. mybot
 
-DB_PATH = "trades.db"
+DB_PATH = "/data/trades.db"
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ─── Хранилище истории диалогов: {user_id: [{"role":..,"content":..}, ...]} ──
