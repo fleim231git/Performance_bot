@@ -726,7 +726,7 @@ async def claude_reply(user_id: int, user_text: str) -> str:
                         "tool_use_id": block.id,
                         "content": tool_result
                     })
-                    logger.info(f"Tool called: {block.name} -> {len(tool_result)} chars")
+                    logger.info(f"Tool called: {block.name} -> {tool_result}")
 
             # Добавляем ответ ассистента и результаты инструментов
             messages_with_tools = history + [
