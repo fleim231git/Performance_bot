@@ -577,7 +577,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 result += f"#{coin}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок)"
                 if dist:
                     dmin_s = f"{dmin:.2f}" if dmin and dmin > 0 else "н/д"
-                    result += f" dist={dist:.2f}({dmin_s}-{dmax:.2f if dmax else 0})"
+                    result += f" dist={dist:.2f}({dmin_s}-{(dmax if dmax else 0):.2f})"
                 if buf: result += f" buf={buf:.2f}"
                 if tp: result += f" tp={tp:.1f}%"
                 result += "\n"
@@ -617,7 +617,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n"
             if dist:
                 dmin_s = f"{dmin:.2f}" if dmin and dmin > 0 else "н/д"
-                result += f"Дистанс: avg={dist:.2f} min={dmin_s} max={dmax:.2f if dmax else 0}\n"
+                result += f"Дистанс: avg={dist:.2f} min={dmin_s} max={(dmax if dmax else 0):.2f}\n"
             if buf: result += f"Буфер: avg={buf:.2f}\n"
             result += "\nТоп трейдеры:\n"
             for t, p, n, d in traders:
@@ -653,7 +653,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
                 dmin_s = f"{dmin:.2f}" if dmin and dmin > 0 else "н/д"
                 result += f"#{coin}: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ WR={wr}%"
-                if dist: result += f" dist={dist:.2f}({dmin_s}-{dmax:.2f if dmax else 0})"
+                if dist: result += f" dist={dist:.2f}({dmin_s}-{(dmax if dmax else 0):.2f})"
                 if buf: result += f" buf={buf:.2f}"
                 result += f" ({cnt} сделок)\n"
 
