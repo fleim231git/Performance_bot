@@ -1186,7 +1186,8 @@ def get_period_context(user_text: str) -> str:
         until = f"{year+1}-01-01T00:00:00" if month_num == 12 else f"{year}-{month_num+1:02d}-01T00:00:00"
         stats = get_stats_for_period(since, until)
         dist_stats = get_distance_stats(since, until)
-        month_name = [k for k, v in MONTH_NAMES.items() if v == month_num and len(k) > 3][0].capitalize()
+        month_candidates = [k for k, v in MONTH_NAMES.items() if v == month_num and len(k) > 3]
+        month_name = month_candidates[0].capitalize() if month_candidates else f"Месяц {month_num}"
         return f"\n\n=== ДАННЫЕ ЗА {month_name.upper()} {year} ===\n{stats}{dist_stats}"
 
     if any(w in text_lower for w in ['за неделю', 'недел', '7 дней', 'семь дней']):
