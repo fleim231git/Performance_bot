@@ -161,29 +161,53 @@ def init_db():
     if stat_count == 0:
         import glob as _glob
         import gzip as _gzip
-        sql_files = _glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "stat_*.sql.gz"))
-        for sql_file in sql_files:
-            logger.info(f"📦 Importing stat data from {sql_file}...")
+        import csv as _csv
+        csv_files = _glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "stat_*.csv.gz"))
+        for csv_file in csv_files:
+            logger.info(f"📦 Importing stat data from {csv_file}...")
             try:
                 imported = 0
-                with _gzip.open(sql_file, 'rt', encoding='utf-8') as f:
+                with _gzip.open(csv_file, 'rt', encoding='utf-8', newline='') as f:
+                    reader = _csv.reader(f)
                     batch = []
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("INSERT"):
-                            batch.append(line)
+                    for row in reader:
+                        if len(row) < 13:
+                            continue
+                        ts, trader, exch, side, coin, dist, buf, tp, pnl, pct, is_p, raw, src = row
+                        batch.append((
+                            ts, trader, exch, side, coin,
+                            float(dist) if dist else None,
+                            float(buf) if buf else None,
+                            float(tp) if tp else None,
+                            float(pnl) if pnl else None,
+                            float(pct) if pct else None,
+                            int(is_p) if is_p else 0,
+                            raw, src
+                        ))
                         if len(batch) >= 5000:
-                            conn.executescript("BEGIN;" + "".join(batch) + "COMMIT;")
+                            c.executemany(
+                                '''INSERT INTO trades(timestamp,trader,exchange,side,coin,
+                                   distance,buffer,take_profit,profit_usd,profit_pct,
+                                   is_profit,raw_message,source)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''', batch
+                            )
+                            conn.commit()
                             imported += len(batch)
                             batch = []
                             if imported % 50000 == 0:
                                 logger.info(f"  ... {imported} trades imported")
                     if batch:
-                        conn.executescript("BEGIN;" + "".join(batch) + "COMMIT;")
+                        c.executemany(
+                            '''INSERT INTO trades(timestamp,trader,exchange,side,coin,
+                               distance,buffer,take_profit,profit_usd,profit_pct,
+                               is_profit,raw_message,source)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''', batch
+                        )
+                        conn.commit()
                         imported += len(batch)
-                logger.info(f"✅ Imported {sql_file}: {imported} trades")
+                logger.info(f"✅ Imported {csv_file}: {imported} trades")
             except Exception as e:
-                logger.error(f"❌ Failed to import {sql_file}: {e}")
+                logger.error(f"❌ Failed to import {csv_file}: {e}")
 
     conn.close()
 

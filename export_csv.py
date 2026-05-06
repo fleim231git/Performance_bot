@@ -2,6 +2,8 @@ import ijson
 import re
 import sys
 import gzip
+import csv
+import io
 
 
 def flatten_text(text_field) -> str:
@@ -12,17 +14,13 @@ def flatten_text(text_field) -> str:
     return ''
 
 
-def escape_sql(s: str) -> str:
-    return s.replace("'", "''")
-
-
 def parse_and_export(json_path: str, exchange: str, output_path: str):
     print(f"Parsing {json_path}...")
     parsed = 0
     total = 0
 
-    with gzip.open(output_path, 'wt', encoding='utf-8') as out:
-        out.write("BEGIN TRANSACTION;\n")
+    with gzip.open(output_path, 'wt', encoding='utf-8', newline='') as out:
+        writer = csv.writer(out)
 
         with open(json_path, 'rb') as f:
             for msg in ijson.items(f, 'messages.item'):
@@ -45,15 +43,15 @@ def parse_and_export(json_path: str, exchange: str, output_path: str):
                 side = side_match.group(1).upper() if side_match else "Unknown"
 
                 dist_match = re.search(r'\b(?:BUY|SELL)\s+([\d.]+)', text, re.IGNORECASE)
-                distance = dist_match.group(1) if dist_match else "NULL"
+                distance = float(dist_match.group(1)) if dist_match else ""
 
                 pnl_match = re.search(r'(?:Profit|Loss)\s*([+-]?\d+\.?\d*)[$]', text, re.IGNORECASE)
                 if not pnl_match:
                     continue
-                profit_usd = pnl_match.group(1)
+                profit_usd = float(pnl_match.group(1))
 
                 pct_match = re.search(r'[$]\s*\(([+-]?\d+\.?\d*)%\)', text)
-                profit_pct = pct_match.group(1) if pct_match else "NULL"
+                profit_pct = float(pct_match.group(1)) if pct_match else ""
 
                 coin_match = re.search(r'#([^\s]+USDT)', text)
                 if not coin_match:
@@ -61,35 +59,26 @@ def parse_and_export(json_path: str, exchange: str, output_path: str):
                 coin = coin_match.group(1)
 
                 tp_matches = re.findall(r'\(([+-]?\d+\.?\d*)%\)', text)
-                take_profit = tp_matches[-1] if tp_matches else "NULL"
+                take_profit = float(tp_matches[-1]) if tp_matches else ""
 
-                pnl_f = float(profit_usd)
-                pct_f = float(profit_pct) if profit_pct != "NULL" else None
-                if pct_f is not None and pnl_f != 0:
-                    if pct_f > 110:
-                        pnl_f = round(pnl_f * (110 / pct_f), 4)
-                        pct_f = 110.0
-                    elif pct_f < -106:
-                        pnl_f = round(pnl_f * (-106 / pct_f), 4)
-                        pct_f = -106.0
+                if profit_pct != "" and profit_usd != 0:
+                    if profit_pct > 110:
+                        profit_usd = round(profit_usd * (110 / profit_pct), 4)
+                        profit_pct = 110.0
+                    elif profit_pct < -106:
+                        profit_usd = round(profit_usd * (-106 / profit_pct), 4)
+                        profit_pct = -106.0
 
-                raw = escape_sql(text[:500])
-                dist_val = distance if distance != "NULL" else "NULL"
-                tp_val = take_profit if take_profit != "NULL" else "NULL"
-                pct_val = pct_f if pct_f is not None else "NULL"
-
-                out.write(
-                    f"INSERT INTO trades(timestamp,trader,exchange,side,coin,distance,buffer,"
-                    f"take_profit,profit_usd,profit_pct,is_profit,raw_message,source) VALUES("
-                    f"'{date}','{escape_sql(trader)}','{exchange}','{side}','{escape_sql(coin)}',"
-                    f"{dist_val},NULL,{tp_val},{pnl_f},{pct_val},{is_profit},'{raw}','stat');\n"
-                )
+                writer.writerow([
+                    date, trader, exchange, side, coin,
+                    distance, "",  # buffer
+                    take_profit, profit_usd, profit_pct,
+                    is_profit, text[:500], "stat"
+                ])
                 parsed += 1
 
                 if total % 100000 == 0:
                     print(f"  {total} messages processed, {parsed} trades...")
-
-        out.write("COMMIT;\n")
 
     print(f"\nDone! {parsed} trades from {total} messages")
     print(f"Output: {output_path}")
@@ -97,6 +86,6 @@ def parse_and_export(json_path: str, exchange: str, output_path: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python export_sql.py <result.json> <exchange>")
+        print("Usage: python export_csv.py <result.json> <exchange>")
         sys.exit(1)
-    parse_and_export(sys.argv[1], sys.argv[2], f"stat_{sys.argv[2].lower()}.sql.gz")
+    parse_and_export(sys.argv[1], sys.argv[2], f"stat_{sys.argv[2].lower()}.csv.gz")
