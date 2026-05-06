@@ -1550,20 +1550,24 @@ async def handle_dialog_message(update: Update, context: ContextTypes.DEFAULT_TY
 
     max_len = 4000
     if len(reply) <= max_len:
-        await msg.reply_text(reply, parse_mode="Markdown", message_thread_id=thread_id)
+        parts = [reply]
     else:
         parts = []
-        while reply:
-            if len(reply) <= max_len:
-                parts.append(reply)
+        remaining = reply
+        while remaining:
+            if len(remaining) <= max_len:
+                parts.append(remaining)
                 break
-            split_at = reply.rfind("\n", 0, max_len)
+            split_at = remaining.rfind("\n", 0, max_len)
             if split_at == -1:
                 split_at = max_len
-            parts.append(reply[:split_at])
-            reply = reply[split_at:].lstrip("\n")
-        for part in parts:
+            parts.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip("\n")
+    for part in parts:
+        try:
             await msg.reply_text(part, parse_mode="Markdown", message_thread_id=thread_id)
+        except Exception:
+            await msg.reply_text(part, message_thread_id=thread_id)
 
 async def cmd_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
