@@ -456,9 +456,10 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - "с 18:00" → since = сегодня T18:00:00
 
 ━━━ ПРАВИЛО 8 — ПОИСК В ИНТЕРНЕТЕ ━━━
-- Используй web_search только когда пользователь явно просит найти что-то в интернете
+- Используй web_search когда пользователь просит найти что-то в интернете
 - Например: "найди новости по BTC", "что случилось с AAVE", "поищи эксплойт KelpDAO"
-- Для вопросов о монетах из базы — сначала ищи в базе через tools, и только если пользователь отдельно просит новости — используй web_search
+- Если монеты НЕТ в базе и пользователь спрашивает про неё — используй web_search чтобы найти информацию
+- Для вопросов о монетах из базы — сначала ищи в базе через tools
 - Не используй web_search для аналитики по базе данных — только SQL tools
 - После поиска кратко резюмируй найденное, не цитируй большие куски текста
 
@@ -705,7 +706,8 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             exch_filter = f" [{exchange}]" if exchange else ""
             result = f"Трейдер: {trader}{exch_filter}\n"
             result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n"
-            result += f"Биржи: {', '.join([f'{e}({n}) {'+' if p>=0 else ''}{(p or 0):.1f}$' for e,n,p in exchanges if e])}\n\n"
+            exch_parts = [f"{e}({n}) {'+' if p>=0 else ''}{(p or 0):.1f}$" for e,n,p in exchanges if e]
+            result += f"Биржи: {', '.join(exch_parts)}\n\n"
             coin_lines = []
             for coin, p, n, dmin, dmax, tp, wins in top_coins:
                 dist_data = get_smart_distance(conn, where, params, coin)
@@ -1182,6 +1184,74 @@ async def claude_reply(user_id: int, user_text: str) -> str:
 
         if not reply:
             reply = "⚠️ Нет ответа от Claude."
+
+        NO_DATA_MARKERS = [
+            'не найден', 'нет данных', 'нет в базе', 'отсутствует в базе',
+            'не найдена', 'не найдено', 'нет сделок', 'не торговалась',
+            'no data', 'not found',
+        ]
+        if (not needs_web_search
+                and any(m in reply.lower() for m in NO_DATA_MARKERS)
+                and re.search(r'#?[A-Z]{2,}(?:USDT)?', user_text.upper())):
+            logger.info("🔄 Fallback → web search (no data in DB, coin mentioned)")
+            fallback_prompt = (
+                f"В базе данных нет информации по этому запросу. "
+                f"Используй web_search чтобы найти актуальную информацию в интернете и ответь пользователю.\n\n"
+                f"Вопрос пользователя: {user_text}"
+            )
+            fallback_history = history[:-1] + [{"role": "user", "content": fallback_prompt}]
+            try:
+                fb_response = anthropic_client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2048,
+                    system=system,
+                    tools=TOOLS,
+                    messages=fallback_history,
+                    extra_headers={"anthropic-beta": "web-search-2025-03-05"}
+                )
+                if hasattr(fb_response, "usage"):
+                    request_input += fb_response.usage.input_tokens
+                    request_output += fb_response.usage.output_tokens
+
+                fb_tool_calls = 0
+                while fb_response.stop_reason == "tool_use" and fb_tool_calls < 3:
+                    fb_tool_results = []
+                    fb_assistant_content = fb_response.content
+                    fb_tool_calls += 1
+                    for block in fb_response.content:
+                        if block.type == "tool_use":
+                            fb_tool_result = execute_tool(block.name, block.input)
+                            fb_tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": fb_tool_result
+                            })
+                            logger.info(f"🔧 Fallback tool: {block.name} → {len(fb_tool_result)} chars")
+                    fb_messages = fallback_history + [
+                        {"role": "assistant", "content": fb_assistant_content},
+                        {"role": "user", "content": fb_tool_results}
+                    ]
+                    fb_response = anthropic_client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=2048,
+                        system=system,
+                        tools=TOOLS,
+                        messages=fb_messages,
+                        extra_headers={"anthropic-beta": "web-search-2025-03-05"}
+                    )
+                    if hasattr(fb_response, "usage"):
+                        request_input += fb_response.usage.input_tokens
+                        request_output += fb_response.usage.output_tokens
+
+                fb_reply = ""
+                for block in fb_response.content:
+                    if hasattr(block, "text"):
+                        fb_reply += block.text
+                if fb_reply:
+                    reply = fb_reply
+                    logger.info("✅ Fallback web search succeeded")
+            except Exception as fb_e:
+                logger.error(f"Fallback web search error: {fb_e}")
 
     except Exception as e:
         logger.error(f"Claude API error: {e}")
