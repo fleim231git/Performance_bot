@@ -1111,6 +1111,9 @@ async def claude_reply(user_id: int, user_text: str) -> str:
         'эксплойт', 'exploit', 'hack', 'хак', 'взлом',
         'internet', 'интернет', 'в сети', 'онлайн',
         'search', 'find', 'look up', 'google',
+        'залистили', 'залистил', 'листинг', 'listing', 'делистинг',
+        'что за монет', 'что это за монет', 'что за токен', 'что за проект',
+        'когда добавили', 'новая монета', 'новый токен',
     ]
     needs_web_search = any(kw in user_text.lower() for kw in WEB_SEARCH_KEYWORDS)
 
