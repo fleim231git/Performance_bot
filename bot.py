@@ -165,10 +165,23 @@ def init_db():
         for sql_file in sql_files:
             logger.info(f"📦 Importing stat data from {sql_file}...")
             try:
+                imported = 0
                 with _gzip.open(sql_file, 'rt', encoding='utf-8') as f:
-                    sql = f.read()
-                conn.executescript(sql)
-                logger.info(f"✅ Imported {sql_file}")
+                    batch = []
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("INSERT"):
+                            batch.append(line)
+                        if len(batch) >= 5000:
+                            conn.executescript("BEGIN;" + "".join(batch) + "COMMIT;")
+                            imported += len(batch)
+                            batch = []
+                            if imported % 50000 == 0:
+                                logger.info(f"  ... {imported} trades imported")
+                    if batch:
+                        conn.executescript("BEGIN;" + "".join(batch) + "COMMIT;")
+                        imported += len(batch)
+                logger.info(f"✅ Imported {sql_file}: {imported} trades")
             except Exception as e:
                 logger.error(f"❌ Failed to import {sql_file}: {e}")
 
