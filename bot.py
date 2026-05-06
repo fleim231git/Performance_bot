@@ -24,6 +24,9 @@ DIALOG_CHAT_ID    = int(os.environ.get("DIALOG_CHAT_ID", "0"))
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 BOT_USERNAME      = os.environ.get("BOT_USERNAME", "")
 
+STAT_CHAT_IDS_RAW = os.environ.get("STAT_CHAT_IDS", "")
+STAT_CHAT_IDS     = set(int(x.strip()) for x in STAT_CHAT_IDS_RAW.split(",") if x.strip())
+
 DB_PATH = "/data/trades.db"
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 OPENAI_API_KEY = _os.environ.get("OPENAI_API_KEY")
@@ -146,7 +149,7 @@ def init_db():
         is_profit    INTEGER,
         raw_message  TEXT
     )''')
-    for col, typ in [("distance","REAL"),("buffer","REAL"),("take_profit","REAL")]:
+    for col, typ in [("distance","REAL"),("buffer","REAL"),("take_profit","REAL"),("source","TEXT DEFAULT 'live'")]:
         try:
             c.execute(f'ALTER TABLE trades ADD COLUMN {col} {typ}')
         except Exception:
@@ -229,16 +232,93 @@ def save_trade(trade: dict):
     c.execute(
         '''INSERT INTO trades
            (timestamp,trader,exchange,side,coin,distance,buffer,take_profit,
-            profit_usd,profit_pct,is_profit,raw_message)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
+            profit_usd,profit_pct,is_profit,raw_message,source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
         (datetime.now().isoformat(),
          trade["trader"], trade["exchange"], trade["side"], trade["coin"],
          trade.get("distance"), trade.get("buffer"), trade.get("take_profit"),
          trade["profit_usd"], trade["profit_pct"],
-         trade["is_profit"], trade["raw_message"])
+         trade["is_profit"], trade["raw_message"],
+         trade.get("source", "live"))
     )
     conn.commit()
     conn.close()
+
+
+STAT_EXCHANGE_MAP = {
+    'bnc': 'Binance',
+    'bbt': 'Bybit',
+    'okx': 'OKX',
+}
+
+def parse_stat_trade(text: str) -> dict | None:
+    try:
+        is_profit = 1 if '⬆' in text or 'Profit' in text else (0 if '⬇' in text or 'Loss' in text else None)
+
+        trader_match = re.search(r'(STATS-[a-z]+-\d+|stat\d+)', text, re.IGNORECASE)
+        trader = trader_match.group(1) if trader_match else "Unknown"
+
+        exch_match = re.search(r'STATS-([a-z]+)-', trader, re.IGNORECASE)
+        if exch_match:
+            exchange = STAT_EXCHANGE_MAP.get(exch_match.group(1).lower(), "Unknown")
+        else:
+            if 'Binance' in text:
+                exchange = 'Binance'
+            elif 'Bybit' in text or 'ByBit' in text:
+                exchange = 'Bybit'
+            elif 'OKX' in text:
+                exchange = 'OKX'
+            else:
+                exchange = 'Unknown'
+
+        side_match = re.search(r'\b(BUY|SELL)\b', text, re.IGNORECASE)
+        side = side_match.group(1).upper() if side_match else "Unknown"
+
+        dist_match = re.search(r'\b(?:BUY|SELL)\s+([\d.]+)\s+', text, re.IGNORECASE)
+        distance = float(dist_match.group(1)) if dist_match else None
+
+        buf_match = re.search(r'\b(?:BUY|SELL)\s+[\d.]+\s+(\d+)-(\d+)', text, re.IGNORECASE)
+        buffer = float(buf_match.group(1)) if buf_match else None
+
+        pnl_match = re.search(r'(?:Profit|Loss)\s*([+-]?\d+\.?\d*)[$]', text, re.IGNORECASE)
+        profit_usd = float(pnl_match.group(1)) if pnl_match else None
+
+        pct_match = re.search(r'[$]\s*\(([+-]?\d+\.?\d*)%\)', text)
+        profit_pct = float(pct_match.group(1)) if pct_match else None
+
+        coin_match = re.search(r'#([^\s]+USDT)', text)
+        coin = coin_match.group(1) if coin_match else None
+
+        tp_matches = re.findall(r'\(([+-]?\d+\.?\d*)%\)', text)
+        take_profit = float(tp_matches[-1]) if tp_matches else None
+
+        if not coin or profit_usd is None:
+            return None
+
+        if profit_pct is not None and profit_usd != 0:
+            if profit_pct > 110:
+                profit_usd = round(profit_usd * (110 / profit_pct), 4)
+                profit_pct = 110.0
+            elif profit_pct < -106:
+                profit_usd = round(profit_usd * (-106 / profit_pct), 4)
+                profit_pct = -106.0
+
+        if is_profit is None:
+            is_profit = 1 if profit_usd >= 0 else 0
+
+        is_observ = 'OBSERV' in text
+
+        return {
+            "trader": trader, "exchange": exchange, "side": side,
+            "coin": coin, "distance": distance, "buffer": buffer,
+            "take_profit": take_profit, "profit_usd": profit_usd,
+            "profit_pct": profit_pct, "is_profit": is_profit,
+            "raw_message": text[:500], "source": "stat",
+            "is_observ": is_observ,
+        }
+    except Exception as e:
+        logger.error(f"parse_stat_trade error: {e}")
+        return None
 
 def get_exchange_stats_for_period(since: str, until: str = None) -> str:
     conn = sqlite3.connect(DB_PATH)
@@ -450,7 +530,15 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - Если просят топ по биржам — показывай ТОЛЬКО по биржам, без общего топа
 - Общий топ показывай только если прямо просят "общий" или "по всем биржам"
 
-━━━ ПРАВИЛО 7 — ВРЕМЯ ━━━
+━━━ ПРАВИЛО 7 — ИСТОЧНИКИ ДАННЫХ (source) ━━━
+- В базе два типа данных: live (реальные трейдеры) и stat (статистические аккаунты)
+- По умолчанию все tools показывают только live данные
+- Если пользователь говорит "стат", "статистические", "тестовые", "stat" — передай source="stat"
+- Если говорит "все данные", "общие", "оба" — передай source="all"
+- Stat-аккаунты торгуют на маленьком ордер-сайзе, поэтому PnL в $ не сравнивать с live
+- Для сравнения stat и live используй проценты (WR, profit_pct), не доллары
+
+━━━ ПРАВИЛО 8 — ВРЕМЯ ━━━
 - Timestamp хранится с точностью до секунды
 - "за последний час" → get_period_stats с since = текущее время − 1 час
 - "с 18:00" → since = сегодня T18:00:00
@@ -565,6 +653,8 @@ def fmt_dist_info(dist_data: dict | None) -> str:
 
 
 # ─── TOOLS для Claude ─────────────────────────────────────────────────────────
+SOURCE_PARAM = {"type": "string", "description": "Источник данных: live (реальные трейдеры, по умолчанию), stat (статистические аккаунты), all (оба)"}
+
 TOOLS = [
     {
         "name": "get_trader_stats",
@@ -577,7 +667,8 @@ TOOLS = [
                 "until": {"type": "string", "description": "Дата/время конца (опционально)"},
                 "exchange": {"type": "string", "description": "Биржа: Binance, Bybit, OKX (опционально)"},
                 "sort_by": {"type": "string", "description": "Сортировка: profit (лучшие) или loss (худшие/убыточные)"},
-                "limit": {"type": "integer", "description": "Количество монет (по умолчанию 10)"}
+                "limit": {"type": "integer", "description": "Количество монет (по умолчанию 10)"},
+                "source": SOURCE_PARAM
             },
             "required": ["trader"]
         }
@@ -590,7 +681,8 @@ TOOLS = [
             "properties": {
                 "coin": {"type": "string", "description": "Название монеты например BTCUSDT"},
                 "since": {"type": "string", "description": "Дата/время начала (опционально)"},
-                "until": {"type": "string", "description": "Дата/время конца (опционально)"}
+                "until": {"type": "string", "description": "Дата/время конца (опционально)"},
+                "source": SOURCE_PARAM
             },
             "required": ["coin"]
         }
@@ -607,7 +699,8 @@ TOOLS = [
                 "min_distance": {"type": "number", "description": "Минимальный дистанс для фильтрации"},
                 "max_distance": {"type": "number", "description": "Максимальный дистанс для фильтрации"},
                 "sort_by": {"type": "string", "description": "Сортировка: profit (лучшие) или loss (худшие)"},
-                "exchange": {"type": "string", "description": "Фильтр по бирже: Binance, Bybit, OKX (опционально)"}
+                "exchange": {"type": "string", "description": "Фильтр по бирже: Binance, Bybit, OKX (опционально)"},
+                "source": SOURCE_PARAM
             }
         }
     },
@@ -618,7 +711,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "since": {"type": "string", "description": "Дата начала (опционально)"},
-                "until": {"type": "string", "description": "Дата конца (опционально)"}
+                "until": {"type": "string", "description": "Дата конца (опционально)"},
+                "source": SOURCE_PARAM
             }
         }
     },
@@ -629,7 +723,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "since": {"type": "string", "description": "Дата/время начала. Форматы: YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS"},
-                "until": {"type": "string", "description": "Дата/время конца (опционально)"}
+                "until": {"type": "string", "description": "Дата/время конца (опционально)"},
+                "source": SOURCE_PARAM
             },
             "required": ["since"]
         }
@@ -653,6 +748,14 @@ def parse_dt(dt_str: str, end_of_day: bool = False) -> str:
     return dt_str + "T00:00:00"
 
 
+def apply_source_filter(where: str, params: list, source: str | None) -> tuple[str, list]:
+    if not source or source == "live":
+        where += " AND (source='live' OR source IS NULL)"
+    elif source == "stat":
+        where += " AND source='stat'"
+    return where, params
+
+
 def execute_tool(tool_name: str, tool_input: dict) -> str:
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -666,6 +769,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             exchange = tool_input.get("exchange")
             sort_by = tool_input.get("sort_by", "profit")
             limit = tool_input.get("limit", 10)
+            source = tool_input.get("source")
 
             where = "WHERE trader=?"
             params = [trader]
@@ -678,6 +782,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             if exchange:
                 where += " AND exchange=?"
                 params.append(exchange)
+            where, params = apply_source_filter(where, params, source)
 
             c.execute(f"""SELECT COUNT(*), SUM(profit_usd),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
@@ -730,6 +835,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             if not coin.endswith("USDT"): coin += "USDT"
             since = tool_input.get("since")
             until = tool_input.get("until")
+            source = tool_input.get("source")
 
             where = "WHERE coin=?"
             params = [coin]
@@ -739,6 +845,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             if until:
                 where += " AND timestamp<=?"
                 params.append(parse_dt(until, end_of_day=True))
+            where, params = apply_source_filter(where, params, source)
 
             c.execute(f"""SELECT COUNT(*), SUM(profit_usd),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
@@ -780,6 +887,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             max_dist = tool_input.get("max_distance")
             sort_by = tool_input.get("sort_by", "profit")
             exchange = tool_input.get("exchange")
+            source = tool_input.get("source")
 
             where_base = "WHERE 1=1"
             params = []
@@ -792,6 +900,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             if exchange:
                 where_base += " AND exchange=?"
                 params.append(exchange)
+            where_base, params = apply_source_filter(where_base, params, source)
 
             where_dist = where_base + " AND distance IS NOT NULL AND distance > 0"
             params_dist = list(params)
@@ -892,6 +1001,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         elif tool_name == "get_all_traders":
             since = tool_input.get("since")
             until = tool_input.get("until")
+            source = tool_input.get("source")
 
             where = "WHERE 1=1"
             params = []
@@ -901,6 +1011,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             if until:
                 where += " AND timestamp<=?"
                 params.append(parse_dt(until, end_of_day=True))
+            where, params = apply_source_filter(where, params, source)
 
             c.execute(f"""SELECT trader, COUNT(*), SUM(profit_usd),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
@@ -944,12 +1055,14 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
         elif tool_name == "get_period_stats":
             since = tool_input["since"]
             until = tool_input.get("until")
+            source = tool_input.get("source")
 
             where = "WHERE timestamp>=?"
             params = [parse_dt(since)]
             if until:
                 where += " AND timestamp<=?"
                 params.append(parse_dt(until, end_of_day=True))
+            where, params = apply_source_filter(where, params, source)
 
             c.execute(f"""SELECT COUNT(*), SUM(profit_usd),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
@@ -1281,13 +1394,22 @@ async def claude_reply(user_id: int, user_text: str) -> str:
 
 async def handle_trade_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post or update.message
-    if not msg or msg.chat.id != SOURCE_CHAT_ID:
+    if not msg:
         return
-    text  = msg.text or ""
-    trade = parse_trade(text)
-    if trade:
-        save_trade(trade)
-        logger.info(f"Saved: {trade['trader']} | {trade['coin']} | {trade['profit_usd']}$")
+    chat_id = msg.chat.id
+    text = msg.text or ""
+
+    if chat_id == SOURCE_CHAT_ID:
+        trade = parse_trade(text)
+        if trade:
+            trade["source"] = "live"
+            save_trade(trade)
+            logger.info(f"Saved [live]: {trade['trader']} | {trade['coin']} | {trade['profit_usd']}$")
+    elif chat_id in STAT_CHAT_IDS:
+        trade = parse_stat_trade(text)
+        if trade:
+            save_trade(trade)
+            logger.info(f"Saved [stat]: {trade['trader']} | {trade['coin']} | {trade['exchange']} | {trade['profit_usd']}$")
 
 
 async def transcribe_voice(file_path: str) -> str | None:
@@ -1877,7 +1999,8 @@ async def main():
     app.add_handler(CommandHandler("clear",        cmd_clear_history))
     app.add_handler(CommandHandler("help",         cmd_help))
     app.add_handler(CommandHandler("start",        cmd_help))
-    app.add_handler(MessageHandler(filters.Chat(SOURCE_CHAT_ID) & filters.ALL, handle_trade_message))
+    trade_chat_ids = [SOURCE_CHAT_ID] + list(STAT_CHAT_IDS)
+    app.add_handler(MessageHandler(filters.Chat(trade_chat_ids) & filters.ALL, handle_trade_message))
     app.add_handler(MessageHandler(filters.Chat(DIALOG_CHAT_ID) & filters.TEXT & ~filters.COMMAND, handle_dialog_message))
     app.add_handler(MessageHandler(filters.Chat(DIALOG_CHAT_ID) & (filters.VOICE | filters.AUDIO), handle_dialog_message))
     app.add_error_handler(error_handler)
