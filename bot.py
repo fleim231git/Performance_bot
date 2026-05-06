@@ -155,6 +155,23 @@ def init_db():
         except Exception:
             pass
     conn.commit()
+
+    c.execute("SELECT COUNT(*) FROM trades WHERE source='stat'")
+    stat_count = c.fetchone()[0]
+    if stat_count == 0:
+        import glob as _glob
+        import gzip as _gzip
+        sql_files = _glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "stat_*.sql.gz"))
+        for sql_file in sql_files:
+            logger.info(f"📦 Importing stat data from {sql_file}...")
+            try:
+                with _gzip.open(sql_file, 'rt', encoding='utf-8') as f:
+                    sql = f.read()
+                conn.executescript(sql)
+                logger.info(f"✅ Imported {sql_file}")
+            except Exception as e:
+                logger.error(f"❌ Failed to import {sql_file}: {e}")
+
     conn.close()
 
 def parse_trade(text: str) -> dict | None:
