@@ -840,14 +840,17 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 params.append(exchange)
             where, params = apply_source_filter(where, params, source)
 
+            is_stat = source == "stat"
+
             c.execute(f"""SELECT COUNT(*), SUM(profit_usd),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where}""", params)
             row = c.fetchone()
             if not row or not row[0]:
                 return f"Трейдер {trader} не найден."
 
-            cnt, pnl, wins = row
+            cnt, pnl, wins, avg_pct = row
             wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
 
             order = "ASC" if sort_by == "loss" else "DESC"
@@ -855,24 +858,33 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                          MIN(CASE WHEN distance>0 THEN distance END),
                          MAX(CASE WHEN distance>0 THEN distance END),
                          AVG(CASE WHEN take_profit!=0 THEN take_profit END),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where}
                          GROUP BY coin ORDER BY SUM(profit_usd) {order} LIMIT {limit}""", params)
             top_coins = c.fetchall()
 
-            c.execute(f"""SELECT exchange, COUNT(*), SUM(profit_usd) FROM trades {where}
+            c.execute(f"""SELECT exchange, COUNT(*), SUM(profit_usd), AVG(profit_pct) FROM trades {where}
                          GROUP BY exchange ORDER BY COUNT(*) DESC""", params)
             exchanges = c.fetchall()
 
             exch_filter = f" [{exchange}]" if exchange else ""
             result = f"Трейдер: {trader}{exch_filter}\n"
-            result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n"
-            exch_parts = [f"{e}({n}) {'+' if p>=0 else ''}{(p or 0):.1f}$" for e,n,p in exchanges if e]
+            if is_stat:
+                result += f"Сделок: {cnt} | avg {'+' if (avg_pct or 0)>=0 else ''}{(avg_pct or 0):.1f}% | WR: {wr}%\n"
+                exch_parts = [f"{e}({n}) avg {'+' if (ap or 0)>=0 else ''}{(ap or 0):.1f}%" for e,n,p,ap in exchanges if e]
+            else:
+                result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n"
+                exch_parts = [f"{e}({n}) {'+' if p>=0 else ''}{(p or 0):.1f}$" for e,n,p,ap in exchanges if e]
             result += f"Биржи: {', '.join(exch_parts)}\n\n"
             coin_lines = []
-            for coin, p, n, dmin, dmax, tp, wins in top_coins:
+            for coin, p, n, dmin, dmax, tp, wins, coin_avg_pct in top_coins:
                 dist_data = get_smart_distance(conn, where, params, coin)
-                line = f"#{coin}: {'+' if p>=0 else ''}{(p or 0):.2f}$"
+                if is_stat:
+                    coin_wr = round((wins or 0)/n*100 if n > 0 else 0, 1)
+                    line = f"#{coin}: avg {'+' if (coin_avg_pct or 0)>=0 else ''}{(coin_avg_pct or 0):.1f}% | WR {coin_wr}%"
+                else:
+                    line = f"#{coin}: {'+' if p>=0 else ''}{(p or 0):.2f}$"
                 if dmin and dmax:
                     if dist_data and dist_data.get("smart"):
                         line += f" | ⚡️{fmt_dist(dist_data['working'])} 🛡{fmt_dist(dist_data['insurance'])} ({fmt_dist(dmin)}–{fmt_dist(dmax)})"
@@ -903,24 +915,30 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 params.append(parse_dt(until, end_of_day=True))
             where, params = apply_source_filter(where, params, source)
 
+            is_stat = source == "stat"
+
             c.execute(f"""SELECT COUNT(*), SUM(profit_usd),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
-                         AVG(distance), MIN(distance), MAX(distance), AVG(buffer)
+                         AVG(distance), MIN(distance), MAX(distance), AVG(buffer),
+                         AVG(profit_pct)
                          FROM trades {where}""", params)
             row = c.fetchone()
             if not row or not row[0]:
                 return f"Монета {coin} не найдена."
 
-            cnt, pnl, wins, dist, dmin, dmax, buf = row
+            cnt, pnl, wins, dist, dmin, dmax, buf, avg_pct = row
             wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
 
-            c.execute(f"""SELECT trader, SUM(profit_usd), COUNT(*), AVG(distance)
+            c.execute(f"""SELECT trader, SUM(profit_usd), COUNT(*), AVG(distance), AVG(profit_pct)
                          FROM trades {where}
                          GROUP BY trader ORDER BY SUM(profit_usd) DESC LIMIT 5""", params)
             traders = c.fetchall()
 
             result = f"Монета: #{coin}\n"
-            result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n"
+            if is_stat:
+                result += f"Сделок: {cnt} | avg {'+' if (avg_pct or 0)>=0 else ''}{(avg_pct or 0):.1f}% | WR: {wr}%\n"
+            else:
+                result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n"
             if dist:
                 dmin_s = fmt_dist(dmin) if dmin and dmin > 0 else "н/д"
                 dist_data = get_smart_distance(conn, where, params, coin)
@@ -930,8 +948,11 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                     result += f"Дистанс: avg={fmt_dist(dist)} min={dmin_s} max={fmt_dist(dmax)}\n"
             if buf: result += f"Буфер: avg={fmt_dist(buf)}\n"
             result += "\nТоп трейдеры:\n"
-            for t, p, n, d in traders:
-                result += f"{t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок)"
+            for t, p, n, d, t_pct in traders:
+                if is_stat:
+                    result += f"{t}: avg {'+' if (t_pct or 0)>=0 else ''}{(t_pct or 0):.1f}% ({n} сделок)"
+                else:
+                    result += f"{t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок)"
                 if d: result += f" dist={fmt_dist(d)}"
                 result += "\n"
 
@@ -969,12 +990,15 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             order = "ASC" if sort_by == "loss" else "DESC"
 
+            is_stat = source == "stat"
+
             c.execute(f"""SELECT coin, SUM(profit_usd), COUNT(*),
                          AVG(CASE WHEN distance>0 THEN distance END),
                          MIN(CASE WHEN distance>0 THEN distance END),
                          MAX(CASE WHEN distance>0 THEN distance END),
                          AVG(CASE WHEN buffer>0 THEN buffer END),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where_base}
                          GROUP BY coin ORDER BY SUM(profit_usd) {order} LIMIT ?""",
                      params + [limit])
@@ -990,9 +1014,13 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             if exchange:
                 dist_filter += f" | 🏦{exchange}"
 
-            def fmt_coin_row(coin, pnl, cnt, dist, dmin, dmax, buf, wins):
+            def fmt_coin_row(coin, pnl, cnt, dist, dmin, dmax, buf, wins, avg_pct):
                 sign = "🟢" if (pnl or 0) >= 0 else "🔴"
-                line = f"{sign} #{coin}: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$"
+                if is_stat:
+                    wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
+                    line = f"{sign} #{coin}: avg {'+' if (avg_pct or 0)>=0 else ''}{(avg_pct or 0):.1f}% | WR {wr}%"
+                else:
+                    line = f"{sign} #{coin}: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$"
                 if dist:
                     dist_data = get_smart_distance(conn, where_dist, params_dist, coin)
                     line += fmt_dist_info(dist_data)
@@ -1022,7 +1050,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             result += f"\nИТОГО В СПИСКЕ: {total_coins} монет\n"
 
             all_dist_data = []
-            for coin, pnl, cnt, dist, dmin, dmax, buf, wins in rows:
+            for coin, pnl, cnt, dist, dmin, dmax, buf, wins, _avg_pct in rows:
                 if dist:
                     dd = get_smart_distance(conn, where_dist, params_dist, coin)
                     if dd:
@@ -1044,7 +1072,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             EXCHANGES = ["Binance", "Bybit", "OKX"]
             result += "\nДИСТАНСЫ ПО БИРЖАМ:\n"
-            for coin, pnl, cnt, dist, dmin, dmax, buf, wins in rows[:5]:
+            for coin, pnl, cnt, dist, dmin, dmax, buf, wins, _avg_pct in rows[:5]:
                 result += f"#{coin}:\n"
                 for exch in EXCHANGES:
                     w_exch = where_base + " AND exchange=?"
@@ -1069,17 +1097,20 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 params.append(parse_dt(until, end_of_day=True))
             where, params = apply_source_filter(where, params, source)
 
+            is_stat = source == "stat"
+
             c.execute(f"""SELECT trader, COUNT(*), SUM(profit_usd),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where}
                          GROUP BY trader ORDER BY SUM(profit_usd) DESC""", params)
             rows = c.fetchall()
 
             from collections import defaultdict
-            grouped = defaultdict(lambda: [0, 0.0, 0])
+            grouped = defaultdict(lambda: [0, 0.0, 0, 0.0, 0])
             ungrouped = []
 
-            for t, cnt, pnl, wins in rows:
+            for t, cnt, pnl, wins, avg_pct in rows:
                 if t.lower().startswith('dcc-'):
                     parts = t.lower().split('-')
                     sub = parts[1][:3] if len(parts) >= 2 else ''
@@ -1088,25 +1119,34 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                     prefix = t[:3].upper()
                     real_name = TRADER_MAP.get(prefix)
                 if real_name:
+                    old_cnt = grouped[real_name][0]
                     grouped[real_name][0] += cnt
                     grouped[real_name][1] += (pnl or 0)
                     grouped[real_name][2] += (wins or 0)
+                    new_cnt = grouped[real_name][0]
+                    grouped[real_name][3] = (grouped[real_name][3] * old_cnt + (avg_pct or 0) * cnt) / new_cnt if new_cnt > 0 else 0
                 else:
-                    ungrouped.append((t, cnt, pnl or 0, wins or 0))
+                    ungrouped.append((t, cnt, pnl or 0, wins or 0, avg_pct or 0))
 
             result = f"Трейдеры группы ({len(grouped)} человек):\n\n"
             result += "✅ С реальными именами:\n"
             sorted_grouped = sorted(grouped.items(), key=lambda x: x[1][1], reverse=True)
-            for name, (cnt, pnl, wins) in sorted_grouped:
+            for name, (cnt, pnl, wins, avg_pct, _) in sorted_grouped:
                 wr = round(wins/cnt*100 if cnt > 0 else 0, 1)
                 icon = "🟢" if pnl >= 0 else "🔴"
-                result += f"{icon} {name}: {'+' if pnl>=0 else ''}{pnl:.2f}$ | {cnt} сделок | WR {wr}%\n"
+                if is_stat:
+                    result += f"{icon} {name}: avg {'+' if avg_pct>=0 else ''}{avg_pct:.1f}% | {cnt} сделок | WR {wr}%\n"
+                else:
+                    result += f"{icon} {name}: {'+' if pnl>=0 else ''}{pnl:.2f}$ | {cnt} сделок | WR {wr}%\n"
 
             if ungrouped:
                 result += f"\n❓ Неопознанные ({len(ungrouped)}):\n"
-                for t, cnt, pnl, wins in sorted(ungrouped, key=lambda x: x[2], reverse=True)[:10]:
+                for t, cnt, pnl, wins, avg_pct in sorted(ungrouped, key=lambda x: x[2], reverse=True)[:10]:
                     wr = round(wins/cnt*100 if cnt > 0 else 0, 1)
-                    result += f"  {t}: {'+' if pnl>=0 else ''}{pnl:.2f}$ | {cnt} сделок | WR {wr}%\n"
+                    if is_stat:
+                        result += f"  {t}: avg {'+' if avg_pct>=0 else ''}{avg_pct:.1f}% | {cnt} сделок | WR {wr}%\n"
+                    else:
+                        result += f"  {t}: {'+' if pnl>=0 else ''}{pnl:.2f}$ | {cnt} сделок | WR {wr}%\n"
 
         elif tool_name == "get_period_stats":
             since = tool_input["since"]
@@ -1120,44 +1160,62 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 params.append(parse_dt(until, end_of_day=True))
             where, params = apply_source_filter(where, params, source)
 
+            is_stat = source == "stat"
+
             c.execute(f"""SELECT COUNT(*), SUM(profit_usd),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where}""", params)
-            cnt, pnl, wins = c.fetchone()
+            cnt, pnl, wins, avg_pct = c.fetchone()
             wr = round((wins or 0)/(cnt or 1)*100, 1)
 
             c.execute(f"""SELECT trader, SUM(profit_usd), COUNT(*),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where}
                          GROUP BY trader ORDER BY SUM(profit_usd) DESC LIMIT 10""", params)
             traders = c.fetchall()
 
             c.execute(f"""SELECT coin, SUM(profit_usd), COUNT(*),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where}
                          GROUP BY coin ORDER BY SUM(profit_usd) DESC LIMIT 5""", params)
             top_coins_p = c.fetchall()
 
             c.execute(f"""SELECT coin, SUM(profit_usd), COUNT(*),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
+                         AVG(profit_pct)
                          FROM trades {where}
                          GROUP BY coin ORDER BY SUM(profit_usd) ASC LIMIT 3""", params)
             worst_coins_p = c.fetchall()
 
             result = f"Период: {since} — {until or 'сейчас'}\n"
-            result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n\n"
+            if is_stat:
+                result += f"Сделок: {cnt} | avg {'+' if (avg_pct or 0)>=0 else ''}{(avg_pct or 0):.1f}% | WR: {wr}%\n\n"
+            else:
+                result += f"Сделок: {cnt} | PnL: {'+' if pnl>=0 else ''}{(pnl or 0):.2f}$ | WR: {wr}%\n\n"
             result += "Топ-5 монет:\n"
-            for coin_r, p_r, n_r, w_r in top_coins_p:
+            for coin_r, p_r, n_r, w_r, cpct in top_coins_p:
                 cwr = round((w_r or 0)/n_r*100 if n_r > 0 else 0, 1)
-                result += f"  #{coin_r}: {'+' if p_r>=0 else ''}{(p_r or 0):.2f}$ ({n_r} сделок WR={cwr}%)\n"
+                if is_stat:
+                    result += f"  #{coin_r}: avg {'+' if (cpct or 0)>=0 else ''}{(cpct or 0):.1f}% ({n_r} сделок WR={cwr}%)\n"
+                else:
+                    result += f"  #{coin_r}: {'+' if p_r>=0 else ''}{(p_r or 0):.2f}$ ({n_r} сделок WR={cwr}%)\n"
             result += "Худшие монеты:\n"
-            for coin_r, p_r, n_r, w_r in worst_coins_p:
+            for coin_r, p_r, n_r, w_r, cpct in worst_coins_p:
                 cwr = round((w_r or 0)/n_r*100 if n_r > 0 else 0, 1)
-                result += f"  #{coin_r}: {'+' if p_r>=0 else ''}{(p_r or 0):.2f}$ ({n_r} сделок WR={cwr}%)\n"
+                if is_stat:
+                    result += f"  #{coin_r}: avg {'+' if (cpct or 0)>=0 else ''}{(cpct or 0):.1f}% ({n_r} сделок WR={cwr}%)\n"
+                else:
+                    result += f"  #{coin_r}: {'+' if p_r>=0 else ''}{(p_r or 0):.2f}$ ({n_r} сделок WR={cwr}%)\n"
             result += "\nТоп трейдеры:\n"
-            for t, p, n, w in traders:
+            for t, p, n, w, tpct in traders:
                 twr = round((w or 0)/n*100 if n > 0 else 0, 1)
-                result += f"  {t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок WR={twr}%)\n"
+                if is_stat:
+                    result += f"  {t}: avg {'+' if (tpct or 0)>=0 else ''}{(tpct or 0):.1f}% ({n} сделок WR={twr}%)\n"
+                else:
+                    result += f"  {t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок WR={twr}%)\n"
 
     except Exception as e:
         result = f"Ошибка запроса: {e}"
