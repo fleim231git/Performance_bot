@@ -26,6 +26,7 @@ BOT_USERNAME      = os.environ.get("BOT_USERNAME", "")
 
 STAT_CHAT_IDS_RAW = os.environ.get("STAT_CHAT_IDS", "")
 STAT_CHAT_IDS     = set(int(x.strip()) for x in STAT_CHAT_IDS_RAW.split(",") if x.strip())
+ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0"))
 
 DB_PATH = "/data/trades.db"
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -2463,7 +2464,11 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет БД файлом в Telegram."""
+    """Отправляет БД файлом в Telegram. Только для админа."""
+    user_id = update.effective_user.id if update.effective_user else 0
+    if ADMIN_USER_ID and user_id != ADMIN_USER_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
     if not os.path.exists(DB_PATH):
         await update.message.reply_text("БД не найдена.")
         return
