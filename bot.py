@@ -1800,6 +1800,13 @@ async def claude_reply(user_id: int, user_text: str) -> str:
     knowledge_ctx = get_knowledge_context(user_text)
     feedback_ctx = get_feedback_context()
     enriched_text = user_text + period_ctx if period_ctx else user_text
+
+    # Автодетект source=stat по ключевым словам
+    lower_text = user_text.lower()
+    stat_keywords = ["стат", "тестов", "stat", "тестовы"]
+    if any(kw in lower_text for kw in stat_keywords):
+        enriched_text += "\n[SYSTEM: пользователь просит данные stat-аккаунтов. Передай source=\"stat\" в КАЖДЫЙ вызов tool. Показывай ROE (%), не доллары. ОБЯЗАТЕЛЬНО покажи дельта-разбивку.]"
+
     history.append({"role": "user", "content": enriched_text})
 
     db_ctx = get_db_context()
