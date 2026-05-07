@@ -156,6 +156,38 @@ def init_db():
             c.execute(f'ALTER TABLE trades ADD COLUMN {col} {typ}')
         except Exception:
             pass
+
+    # Knowledge base — заметки, правила, наблюдения
+    c.execute('''CREATE TABLE IF NOT EXISTS knowledge (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        created   TEXT DEFAULT (datetime('now')),
+        category  TEXT,
+        content   TEXT,
+        source    TEXT DEFAULT 'user'
+    )''')
+
+    # Feedback — оценки ответов бота
+    c.execute('''CREATE TABLE IF NOT EXISTS feedback (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        created   TEXT DEFAULT (datetime('now')),
+        user_id   INTEGER,
+        question  TEXT,
+        answer    TEXT,
+        rating    INTEGER,
+        comment   TEXT
+    )''')
+
+    # Query log — что спрашивают (для аналитики и обучения)
+    c.execute('''CREATE TABLE IF NOT EXISTS query_log (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        created   TEXT DEFAULT (datetime('now')),
+        user_id   INTEGER,
+        question  TEXT,
+        tools_used TEXT,
+        tokens_in  INTEGER,
+        tokens_out INTEGER,
+        cost       REAL
+    )''')
     conn.commit()
 
     c.execute("SELECT COUNT(*) FROM trades WHERE source='stat'")
@@ -617,7 +649,14 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - "за последний час" → get_period_stats с since = текущее время − 1 час
 - "с 18:00" → since = сегодня T18:00:00
 
-━━━ ПРАВИЛО 9 — ПОИСК В ИНТЕРНЕТЕ ━━━
+━━━ ПРАВИЛО 9 — ПАМЯТЬ И ОБУЧЕНИЕ ━━━
+- manage_knowledge — сохраняй заметки когда пользователь говорит "запомни", "правило:", "заметка:"
+- Категории: правило, монета, трейдер, стратегия, наблюдение, важно
+- Перед ответом проверяй БАЗА ЗНАНИЙ в контексте — там могут быть подсказки
+- Если в ФИДБЕК есть замечания — учитывай их
+- Пользователь может оценить ответ: 👍/👎/+/- или "плохо: причина"
+
+━━━ ПРАВИЛО 10 — ПОИСК В ИНТЕРНЕТЕ ━━━
 - Используй web_search когда пользователь просит найти что-то в интернете
 - Например: "найди новости по BTC", "что случилось с AAVE", "поищи эксплойт KelpDAO"
 - Если монеты НЕТ в базе и пользователь спрашивает про неё — используй web_search чтобы найти информацию
@@ -823,6 +862,21 @@ TOOLS = [
                 "min_trades": {"type": "integer", "description": "Минимум сделок для включения (по умолчанию 10)"},
                 "source": SOURCE_PARAM
             }
+        }
+    },
+    {
+        "name": "manage_knowledge",
+        "description": "Управление базой знаний: добавить заметку, найти по ключевому слову, или получить все записи категории. Используй когда пользователь говорит 'запомни', 'добавь правило', 'заметка:' или спрашивает что ты помнишь.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "add (добавить), search (найти), list (все записи категории), delete (удалить по id)"},
+                "category": {"type": "string", "description": "Категория: правило, монета, трейдер, стратегия, наблюдение, важно"},
+                "content": {"type": "string", "description": "Текст заметки (для add)"},
+                "query": {"type": "string", "description": "Поисковый запрос (для search)"},
+                "id": {"type": "integer", "description": "ID записи (для delete)"}
+            },
+            "required": ["action"]
         }
     },
     # ─── WEB SEARCH ───────────────────────────────────────────────────────────
@@ -1424,6 +1478,57 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             else:
                 result = f"Неизвестный group_by: {group_by}. Используй: delta, coin, distance, combo"
 
+        elif tool_name == "manage_knowledge":
+            action = tool_input.get("action", "list")
+            category = tool_input.get("category", "")
+            content = tool_input.get("content", "")
+            query = tool_input.get("query", "")
+            kb_id = tool_input.get("id")
+
+            if action == "add" and content:
+                c.execute("INSERT INTO knowledge(category, content) VALUES(?,?)",
+                          (category or "заметка", content))
+                conn.commit()
+                result = f"Записано в категорию '{category or 'заметка'}': {content[:100]}"
+
+            elif action == "search" and query:
+                q_like = f"%{query}%"
+                c.execute("SELECT id, category, content, created FROM knowledge WHERE content LIKE ? OR category LIKE ? ORDER BY id DESC LIMIT 10",
+                          (q_like, q_like))
+                rows = c.fetchall()
+                if rows:
+                    result = f"Найдено {len(rows)} записей:\n"
+                    for kid, cat, txt, dt in rows:
+                        result += f"  [{kid}] ({cat}) {txt[:100]} | {dt}\n"
+                else:
+                    result = f"Ничего не найдено по '{query}'."
+
+            elif action == "list":
+                if category:
+                    c.execute("SELECT id, content, created FROM knowledge WHERE category=? ORDER BY id DESC LIMIT 20", (category,))
+                else:
+                    c.execute("SELECT id, category, content, created FROM knowledge ORDER BY id DESC LIMIT 20")
+                rows = c.fetchall()
+                if rows:
+                    result = f"База знаний ({len(rows)} записей):\n"
+                    for row in rows:
+                        if category:
+                            kid, txt, dt = row
+                            result += f"  [{kid}] {txt[:100]} | {dt}\n"
+                        else:
+                            kid, cat, txt, dt = row
+                            result += f"  [{kid}] ({cat}) {txt[:80]} | {dt}\n"
+                else:
+                    result = "База знаний пуста."
+
+            elif action == "delete" and kb_id:
+                c.execute("DELETE FROM knowledge WHERE id=?", (kb_id,))
+                conn.commit()
+                result = f"Запись #{kb_id} удалена." if c.rowcount > 0 else f"Запись #{kb_id} не найдена."
+
+            else:
+                result = "Неизвестное действие. Используй: add, search, list, delete"
+
     except Exception as e:
         result = f"Ошибка запроса: {e}"
     finally:
@@ -1517,18 +1622,126 @@ def get_period_context(user_text: str) -> str:
     return ""
 
 
+def get_knowledge_context(user_text: str) -> str:
+    """Подтягивает релевантные знания из knowledge base."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Берём последние 20 записей (лёгкий — без full-text search)
+        c.execute("SELECT category, content FROM knowledge ORDER BY id DESC LIMIT 20")
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            return ""
+        text_lower = user_text.lower()
+        relevant = []
+        for cat, content in rows:
+            # Простой keyword matching
+            words = (cat or "").lower().split() + content.lower().split()[:10]
+            if any(w in text_lower for w in words if len(w) > 3):
+                relevant.append(f"[{cat}] {content}")
+        if not relevant:
+            # Всегда добавляем записи с категорией "правило" или "важно"
+            for cat, content in rows:
+                if cat and cat.lower() in ("правило", "важно", "rule", "важное"):
+                    relevant.append(f"[{cat}] {content}")
+        if not relevant:
+            return ""
+        return "\n\n=== БАЗА ЗНАНИЙ ===\n" + "\n".join(relevant[:5])
+    except Exception:
+        return ""
+
+
+def save_query_log(user_id: int, question: str, tools_used: list, tokens_in: int, tokens_out: int, cost: float):
+    """Сохраняет лог запроса для аналитики."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO query_log(user_id, question, tools_used, tokens_in, tokens_out, cost) VALUES(?,?,?,?,?,?)",
+            (user_id, question[:500], ",".join(tools_used), tokens_in, tokens_out, cost)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Query log error: {e}")
+
+
+def save_feedback(user_id: int, question: str, answer: str, rating: int, comment: str = ""):
+    """Сохраняет фидбек на ответ бота."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO feedback(user_id, question, answer, rating, comment) VALUES(?,?,?,?,?)",
+            (user_id, question[:500], answer[:1000], rating, comment[:500])
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Feedback save error: {e}")
+
+
+def get_feedback_context() -> str:
+    """Подтягивает паттерны из фидбека — что нравится, что нет."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM feedback WHERE rating <= 0")
+        bad = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM feedback WHERE rating > 0")
+        good = c.fetchone()[0]
+        tips = []
+        if bad > 0:
+            c.execute("SELECT question, comment FROM feedback WHERE rating <= 0 ORDER BY id DESC LIMIT 3")
+            for q, cm in c.fetchall():
+                if cm:
+                    tips.append(f"Плохой ответ на '{q[:50]}': {cm}")
+        conn.close()
+        if not tips:
+            return ""
+        return "\n\n=== ФИДБЕК (учитывай) ===\n" + "\n".join(tips)
+    except Exception:
+        return ""
+
+
 async def claude_reply(user_id: int, user_text: str) -> str:
     global total_api_cost, total_api_calls
+
+    # Обработка фидбека: 👍/👎/+/-
+    text_stripped = user_text.strip()
+    if text_stripped in ("👍", "+", "хорошо", "верно", "правильно", "отлично"):
+        last_msgs = conversation_history.get(user_id, [])
+        q = next((m["content"] for m in reversed(last_msgs) if m["role"] == "user" and m["content"] != text_stripped), "")
+        a = next((m["content"] for m in reversed(last_msgs) if m["role"] == "assistant"), "")
+        save_feedback(user_id, q, a, 1)
+        return "Спасибо, запомнил! 🦇"
+    if text_stripped in ("👎", "-", "плохо", "неправильно", "неверно"):
+        last_msgs = conversation_history.get(user_id, [])
+        q = next((m["content"] for m in reversed(last_msgs) if m["role"] == "user" and m["content"] != text_stripped), "")
+        a = next((m["content"] for m in reversed(last_msgs) if m["role"] == "assistant"), "")
+        save_feedback(user_id, q, a, -1)
+        return "Понял, учту в будущем. Напиши что было не так — запомню. 🦇"
+    # Фидбек с комментарием: "плохо: показал доллары вместо процентов"
+    if text_stripped.startswith(("плохо:", "неправильно:", "не так:")):
+        comment = text_stripped.split(":", 1)[1].strip()
+        last_msgs = conversation_history.get(user_id, [])
+        q = next((m["content"] for m in reversed(last_msgs) if m["role"] == "user"), "")
+        a = next((m["content"] for m in reversed(last_msgs) if m["role"] == "assistant"), "")
+        save_feedback(user_id, q, a, -1, comment)
+        return f"Записал: {comment}. Буду учитывать! 🦇"
 
     history = conversation_history.setdefault(user_id, [])
     if len(history) >= MAX_HISTORY:
         history[:] = history[-(MAX_HISTORY - 2):]
     period_ctx = get_period_context(user_text)
+    knowledge_ctx = get_knowledge_context(user_text)
+    feedback_ctx = get_feedback_context()
     enriched_text = user_text + period_ctx if period_ctx else user_text
     history.append({"role": "user", "content": enriched_text})
 
     db_ctx = get_db_context()
-    system = f"{SYSTEM_PROMPT}\n\n{db_ctx}"
+    system = f"{SYSTEM_PROMPT}\n\n{db_ctx}{knowledge_ctx}{feedback_ctx}"
 
     system_chars = len(system)
     history_chars = sum(len(str(m.get("content", ""))) for m in history)
@@ -1538,6 +1751,7 @@ async def claude_reply(user_id: int, user_text: str) -> str:
     request_input = 0
     request_output = 0
     tool_calls_count = 0
+    tools_used = []
 
     # Ключевые слова которые указывают что нужен поиск в интернете
     WEB_SEARCH_KEYWORDS = [
@@ -1594,6 +1808,7 @@ async def claude_reply(user_id: int, user_text: str) -> str:
                         "tool_use_id": block.id,
                         "content": tool_result
                     })
+                    tools_used.append(block.name)
                     logger.info(f"🔧 Tool: {block.name} → {len(tool_result)} chars")
 
             messages_with_tools = history + [
@@ -1710,6 +1925,8 @@ async def claude_reply(user_id: int, user_text: str) -> str:
 
     if request_cost > 0.50:
         logger.warning(f"⚠️ EXPENSIVE REQUEST: ${request_cost:.4f} | user={user_id}")
+
+    save_query_log(user_id, user_text, tools_used, request_input, request_output, request_cost)
 
     history.append({"role": "assistant", "content": reply})
     return reply
