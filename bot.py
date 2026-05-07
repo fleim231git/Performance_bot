@@ -1110,6 +1110,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             is_stat = source == "stat"
 
+            sort_col = "SUM(profit_pct)" if is_stat else "SUM(profit_usd)"
             c.execute(f"""SELECT coin, SUM(profit_usd), COUNT(*),
                          AVG(CASE WHEN distance>0 THEN distance END),
                          MIN(CASE WHEN distance>0 THEN distance END),
@@ -1118,7 +1119,7 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
                          SUM(profit_pct)
                          FROM trades {where_base}
-                         GROUP BY coin ORDER BY SUM(profit_usd) {order} LIMIT ?""",
+                         GROUP BY coin ORDER BY {sort_col} {order} LIMIT ?""",
                      params + [limit])
             rows = c.fetchall()
 
@@ -1217,11 +1218,12 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             is_stat = source == "stat"
 
+            sort_col = "SUM(profit_pct)" if is_stat else "SUM(profit_usd)"
             c.execute(f"""SELECT trader, COUNT(*), SUM(profit_usd),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
                          SUM(profit_pct)
                          FROM trades {where}
-                         GROUP BY trader ORDER BY SUM(profit_usd) DESC""", params)
+                         GROUP BY trader ORDER BY {sort_col} DESC""", params)
             rows = c.fetchall()
 
             from collections import defaultdict
@@ -1246,7 +1248,8 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             result = f"Трейдеры группы ({len(grouped)} человек):\n\n"
             result += "✅ С реальными именами:\n"
-            sorted_grouped = sorted(grouped.items(), key=lambda x: x[1][1], reverse=True)
+            sort_key = (lambda x: x[1][3]) if is_stat else (lambda x: x[1][1])
+            sorted_grouped = sorted(grouped.items(), key=sort_key, reverse=True)
             for name, (cnt, pnl, wins, sum_pct) in sorted_grouped:
                 wr = round(wins/cnt*100 if cnt > 0 else 0, 1)
                 icon = "🟢" if pnl >= 0 else "🔴"
@@ -1285,25 +1288,20 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             cnt, pnl, wins, sum_pct = c.fetchone()
             wr = round((wins or 0)/(cnt or 1)*100, 1)
 
-            c.execute(f"""SELECT trader, SUM(profit_usd), COUNT(*),
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
-                         SUM(profit_pct)
-                         FROM trades {where}
-                         GROUP BY trader ORDER BY SUM(profit_usd) DESC LIMIT 10""", params)
-            traders = c.fetchall()
+            sort_col = "SUM(profit_pct)" if is_stat else "SUM(profit_usd)"
 
             c.execute(f"""SELECT coin, SUM(profit_usd), COUNT(*),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
                          SUM(profit_pct)
                          FROM trades {where}
-                         GROUP BY coin ORDER BY SUM(profit_usd) DESC LIMIT 5""", params)
+                         GROUP BY coin ORDER BY {sort_col} DESC LIMIT 5""", params)
             top_coins_p = c.fetchall()
 
             c.execute(f"""SELECT coin, SUM(profit_usd), COUNT(*),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
                          SUM(profit_pct)
                          FROM trades {where}
-                         GROUP BY coin ORDER BY SUM(profit_usd) ASC LIMIT 3""", params)
+                         GROUP BY coin ORDER BY {sort_col} ASC LIMIT 3""", params)
             worst_coins_p = c.fetchall()
 
             result = f"Период: {since} — {until or 'сейчас'}\n"
@@ -1325,13 +1323,34 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                     result += f"  #{coin_r}: ROE {'+' if (cpct or 0)>=0 else ''}{(cpct or 0):.1f}% ({n_r} сделок WR={cwr}%)\n"
                 else:
                     result += f"  #{coin_r}: {'+' if p_r>=0 else ''}{(p_r or 0):.2f}$ ({n_r} сделок WR={cwr}%)\n"
-            result += "\nТоп трейдеры:\n"
-            for t, p, n, w, tpct in traders:
-                twr = round((w or 0)/n*100 if n > 0 else 0, 1)
-                if is_stat:
-                    result += f"  {t}: ROE {'+' if (tpct or 0)>=0 else ''}{(tpct or 0):.1f}% ({n} сделок WR={twr}%)\n"
-                else:
+
+            if not is_stat:
+                c.execute(f"""SELECT trader, SUM(profit_usd), COUNT(*),
+                             SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                             FROM trades {where}
+                             GROUP BY trader ORDER BY SUM(profit_usd) DESC LIMIT 10""", params)
+                traders = c.fetchall()
+                result += "\nТоп трейдеры:\n"
+                for t, p, n, w in traders:
+                    twr = round((w or 0)/n*100 if n > 0 else 0, 1)
                     result += f"  {t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок WR={twr}%)\n"
+            else:
+                # Дельта-разбивка для stat
+                c.execute(f"""SELECT
+                    CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
+                    COUNT(*), SUM(profit_pct),
+                    SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                    FROM trades {where} AND delta_min IS NOT NULL
+                    GROUP BY CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                    HAVING COUNT(*) >= 10
+                    ORDER BY SUM(profit_pct) DESC LIMIT 10""", params)
+                delta_rows = c.fetchall()
+                if delta_rows:
+                    result += "\nТоп дельты (по ROE):\n"
+                    for dr, cnt_d, pct, wins_d in delta_rows:
+                        dwr = round((wins_d or 0)/cnt_d*100 if cnt_d > 0 else 0, 1)
+                        icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                        result += f"  {icon} δ{dr}%: ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}% | WR {dwr}% | {cnt_d} сделок\n"
 
         elif tool_name == "get_delta_analysis":
             group_by = tool_input.get("group_by", "delta")
