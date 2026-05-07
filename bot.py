@@ -149,7 +149,9 @@ def init_db():
         is_profit    INTEGER,
         raw_message  TEXT
     )''')
-    for col, typ in [("distance","REAL"),("buffer","REAL"),("take_profit","REAL"),("source","TEXT DEFAULT 'live'")]:
+    for col, typ in [("distance","REAL"),("buffer","REAL"),("take_profit","REAL"),
+                      ("source","TEXT DEFAULT 'live'"),
+                      ("delta_min","REAL"),("delta_max","REAL"),("is_observ","INTEGER DEFAULT 0")]:
         try:
             c.execute(f'ALTER TABLE trades ADD COLUMN {col} {typ}')
         except Exception:
@@ -173,7 +175,10 @@ def init_db():
                     for row in reader:
                         if len(row) < 13:
                             continue
-                        ts, trader, exch, side, coin, dist, buf, tp, pnl, pct, is_p, raw, src = row
+                        ts, trader, exch, side, coin, dist, buf, tp, pnl, pct, is_p, raw, src = row[:13]
+                        d_min = float(row[13]) if len(row) > 13 and row[13] else None
+                        d_max = float(row[14]) if len(row) > 14 and row[14] else None
+                        obs = int(row[15]) if len(row) > 15 and row[15] else 0
                         batch.append((
                             ts, trader, exch, side, coin,
                             float(dist) if dist else None,
@@ -182,14 +187,14 @@ def init_db():
                             float(pnl) if pnl else None,
                             float(pct) if pct else None,
                             int(is_p) if is_p else 0,
-                            raw, src
+                            raw, src, d_min, d_max, obs
                         ))
                         if len(batch) >= 5000:
                             c.executemany(
                                 '''INSERT INTO trades(timestamp,trader,exchange,side,coin,
                                    distance,buffer,take_profit,profit_usd,profit_pct,
-                                   is_profit,raw_message,source)
-                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''', batch
+                                   is_profit,raw_message,source,delta_min,delta_max,is_observ)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', batch
                             )
                             conn.commit()
                             imported += len(batch)
@@ -200,8 +205,8 @@ def init_db():
                         c.executemany(
                             '''INSERT INTO trades(timestamp,trader,exchange,side,coin,
                                distance,buffer,take_profit,profit_usd,profit_pct,
-                               is_profit,raw_message,source)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''', batch
+                               is_profit,raw_message,source,delta_min,delta_max,is_observ)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', batch
                         )
                         conn.commit()
                         imported += len(batch)
@@ -286,14 +291,17 @@ def save_trade(trade: dict):
     c.execute(
         '''INSERT INTO trades
            (timestamp,trader,exchange,side,coin,distance,buffer,take_profit,
-            profit_usd,profit_pct,is_profit,raw_message,source)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            profit_usd,profit_pct,is_profit,raw_message,source,
+            delta_min,delta_max,is_observ)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
         (datetime.now().isoformat(),
          trade["trader"], trade["exchange"], trade["side"], trade["coin"],
          trade.get("distance"), trade.get("buffer"), trade.get("take_profit"),
          trade["profit_usd"], trade["profit_pct"],
          trade["is_profit"], trade["raw_message"],
-         trade.get("source", "live"))
+         trade.get("source", "live"),
+         trade.get("delta_min"), trade.get("delta_max"),
+         trade.get("is_observ", 0))
     )
     conn.commit()
     conn.close()
@@ -331,8 +339,9 @@ def parse_stat_trade(text: str) -> dict | None:
         dist_match = re.search(r'\b(?:BUY|SELL)\s+([\d.]+)\s+', text, re.IGNORECASE)
         distance = float(dist_match.group(1)) if dist_match else None
 
-        buf_match = re.search(r'\b(?:BUY|SELL)\s+[\d.]+\s+(\d+)-(\d+)', text, re.IGNORECASE)
-        buffer = float(buf_match.group(1)) if buf_match else None
+        delta_match = re.search(r'\b(?:BUY|SELL)\s+[\d.]+\s+([\d.]+)-([\d.]+)', text, re.IGNORECASE)
+        delta_min = float(delta_match.group(1)) if delta_match else None
+        delta_max = float(delta_match.group(2)) if delta_match else None
 
         pnl_match = re.search(r'(?:Profit|Loss)\s*([+-]?\d+\.?\d*)[$]', text, re.IGNORECASE)
         profit_usd = float(pnl_match.group(1)) if pnl_match else None
@@ -364,11 +373,12 @@ def parse_stat_trade(text: str) -> dict | None:
 
         return {
             "trader": trader, "exchange": exchange, "side": side,
-            "coin": coin, "distance": distance, "buffer": buffer,
+            "coin": coin, "distance": distance, "buffer": None,
             "take_profit": take_profit, "profit_usd": profit_usd,
             "profit_pct": profit_pct, "is_profit": is_profit,
             "raw_message": text[:500], "source": "stat",
-            "is_observ": is_observ,
+            "delta_min": delta_min, "delta_max": delta_max,
+            "is_observ": 1 if is_observ else 0,
         }
     except Exception as e:
         logger.error(f"parse_stat_trade error: {e}")
@@ -594,12 +604,20 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - Формат для stat: #COIN +29.8% | dist=0.85% | 50 сделок
 - Для сравнения stat и live используй проценты (WR, profit_pct), не доллары
 
-━━━ ПРАВИЛО 8 — ВРЕМЯ ━━━
+━━━ ПРАВИЛО 8 — ДЕЛЬТЫ (15-мин абсолютная дельта) ━━━
+- Дельта — процент изменения цены за 15-минутный период в момент входа в сделку
+- Абсолютная дельта всегда положительная (мин-макс движения цены)
+- Хранится как диапазон: delta_min и delta_max (например 3-5 = дельта была 3-5%)
+- Используй get_delta_analysis для вопросов типа "при какой дельте лучше входить"
+- Можно фильтровать по монете, дистансу, бирже, стороне (BUY/SELL)
+- Формат: δ0-1% (дельта 0-1%), δ3-5% (дельта 3-5%)
+
+━━━ ПРАВИЛО 8.1 — ВРЕМЯ ━━━
 - Timestamp хранится с точностью до секунды
 - "за последний час" → get_period_stats с since = текущее время − 1 час
 - "с 18:00" → since = сегодня T18:00:00
 
-━━━ ПРАВИЛО 8 — ПОИСК В ИНТЕРНЕТЕ ━━━
+━━━ ПРАВИЛО 9 — ПОИСК В ИНТЕРНЕТЕ ━━━
 - Используй web_search когда пользователь просит найти что-то в интернете
 - Например: "найди новости по BTC", "что случилось с AAVE", "поищи эксплойт KelpDAO"
 - Если монеты НЕТ в базе и пользователь спрашивает про неё — используй web_search чтобы найти информацию
@@ -783,6 +801,24 @@ TOOLS = [
                 "source": SOURCE_PARAM
             },
             "required": ["since"]
+        }
+    },
+    {
+        "name": "get_delta_analysis",
+        "description": "Анализ прибыльности по 15-минутной абсолютной дельте. Показывает ROE и WR для каждого диапазона дельт. Используй для вопросов: при какой дельте лучше входить, какая дельта самая прибыльная для монеты/дистанса.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "coin": {"type": "string", "description": "Монета (опционально, если не указана — по всем)"},
+                "distance": {"type": "number", "description": "Дистанс для фильтрации (опционально)"},
+                "min_distance": {"type": "number", "description": "Минимальный дистанс (опционально)"},
+                "max_distance": {"type": "number", "description": "Максимальный дистанс (опционально)"},
+                "side": {"type": "string", "description": "BUY или SELL (опционально)"},
+                "exchange": {"type": "string", "description": "Биржа: Binance, Bybit, OKX (опционально)"},
+                "since": {"type": "string", "description": "Дата начала (опционально)"},
+                "until": {"type": "string", "description": "Дата конца (опционально)"},
+                "source": SOURCE_PARAM
+            }
         }
     },
     # ─── WEB SEARCH ───────────────────────────────────────────────────────────
@@ -1215,6 +1251,104 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 else:
                     result += f"  {t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок WR={twr}%)\n"
 
+        elif tool_name == "get_delta_analysis":
+            coin = tool_input.get("coin")
+            distance = tool_input.get("distance")
+            min_dist = tool_input.get("min_distance")
+            max_dist = tool_input.get("max_distance")
+            side = tool_input.get("side")
+            exchange = tool_input.get("exchange")
+            since = tool_input.get("since")
+            until = tool_input.get("until")
+            source = tool_input.get("source")
+
+            where = "WHERE delta_min IS NOT NULL"
+            params = []
+            if coin:
+                coin = coin.upper()
+                if not coin.endswith("USDT"): coin += "USDT"
+                where += " AND coin=?"
+                params.append(coin)
+            if distance:
+                where += " AND distance=?"
+                params.append(distance)
+            if min_dist:
+                where += " AND distance>=?"
+                params.append(min_dist)
+            if max_dist:
+                where += " AND distance<=?"
+                params.append(max_dist)
+            if side:
+                where += " AND side=?"
+                params.append(side.upper())
+            if exchange:
+                where += " AND exchange=?"
+                params.append(exchange)
+            if since:
+                where += " AND timestamp>=?"
+                params.append(parse_dt(since))
+            if until:
+                where += " AND timestamp<=?"
+                params.append(parse_dt(until, end_of_day=True))
+            where, params = apply_source_filter(where, params, source)
+
+            is_stat = source == "stat"
+
+            # Группируем по диапазону дельт (delta_min-delta_max как текстовый ключ)
+            c.execute(f"""SELECT
+                         CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as delta_range,
+                         delta_min, delta_max,
+                         COUNT(*) as cnt,
+                         SUM(profit_usd) as total_pnl,
+                         SUM(profit_pct) as total_pct,
+                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END) as wins,
+                         AVG(distance) as avg_dist
+                         FROM trades {where}
+                         GROUP BY CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                         ORDER BY SUM(profit_pct) DESC""", params)
+            rows = c.fetchall()
+
+            if not rows:
+                return "Нет данных по дельтам для заданных фильтров."
+
+            total_cnt = sum(r[3] for r in rows)
+            total_pnl = sum(r[4] or 0 for r in rows)
+            total_pct = sum(r[5] or 0 for r in rows)
+            total_wins = sum(r[6] or 0 for r in rows)
+            total_wr = round(total_wins/total_cnt*100 if total_cnt > 0 else 0, 1)
+
+            filters = []
+            if coin: filters.append(f"#{coin}")
+            if distance: filters.append(f"dist={distance}")
+            elif min_dist or max_dist:
+                if min_dist and max_dist: filters.append(f"dist {min_dist}-{max_dist}")
+                elif min_dist: filters.append(f"dist≥{min_dist}")
+                else: filters.append(f"dist≤{max_dist}")
+            if side: filters.append(side.upper())
+            if exchange: filters.append(exchange)
+            filter_str = f" | {', '.join(filters)}" if filters else ""
+
+            result = f"АНАЛИЗ ПО 15-МИН ДЕЛЬТЕ{filter_str}\n"
+            if is_stat:
+                result += f"Всего: {total_cnt} сделок | ROE {'+' if total_pct>=0 else ''}{total_pct:.1f}% | WR {total_wr}%\n\n"
+            else:
+                result += f"Всего: {total_cnt} сделок | PnL {'+' if total_pnl>=0 else ''}{total_pnl:.2f}$ | WR {total_wr}%\n\n"
+
+            result += "Дельта | Сделок | ROE/PnL | WR | Avg dist\n"
+            result += "─" * 50 + "\n"
+            for dr, dmin, dmax, cnt, pnl, pct, wins, avg_d in rows:
+                wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
+                icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                if is_stat:
+                    val = f"ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}%"
+                else:
+                    val = f"{'+' if (pnl or 0)>=0 else ''}{(pnl or 0):.2f}$"
+                result += f"{icon} δ{dr}% | {cnt} | {val} | WR {wr}% | dist {avg_d:.2f}\n"
+
+            # Лучшая дельта
+            best = rows[0]
+            result += f"\n🏆 Лучшая дельта: {best[0]}% (ROE {'+' if (best[5] or 0)>=0 else ''}{(best[5] or 0):.1f}%, WR {round((best[6] or 0)/best[3]*100 if best[3]>0 else 0,1)}%, {best[3]} сделок)\n"
+
     except Exception as e:
         result = f"Ошибка запроса: {e}"
     finally:
@@ -1523,6 +1657,9 @@ async def handle_trade_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if trade:
             save_trade(trade)
             logger.info(f"Saved [stat]: {trade['trader']} | {trade['coin']} | {trade['exchange']} | {trade['profit_usd']}$")
+    else:
+        if 'stat' in text.lower() or 'STATS' in text or 'Profit' in text or 'Loss' in text:
+            logger.info(f"⚠️ Unknown chat_id={chat_id} | {text[:80]}")
 
 
 async def transcribe_voice(file_path: str) -> str | None:

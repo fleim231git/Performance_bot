@@ -45,6 +45,12 @@ def parse_and_export(json_path: str, exchange: str, output_path: str):
                 dist_match = re.search(r'\b(?:BUY|SELL)\s+([\d.]+)', text, re.IGNORECASE)
                 distance = float(dist_match.group(1)) if dist_match else ""
 
+                delta_match = re.search(r'\b(?:BUY|SELL)\s+[\d.]+\s+([\d.]+)-([\d.]+)', text, re.IGNORECASE)
+                delta_min = float(delta_match.group(1)) if delta_match else ""
+                delta_max = float(delta_match.group(2)) if delta_match else ""
+
+                is_observ = 1 if 'OBSERV' in text else 0
+
                 pnl_match = re.search(r'(?:Profit|Loss)\s*([+-]?\d+\.?\d*)[$]', text, re.IGNORECASE)
                 if not pnl_match:
                     continue
@@ -73,7 +79,8 @@ def parse_and_export(json_path: str, exchange: str, output_path: str):
                     date, trader, exchange, side, coin,
                     distance, "",  # buffer
                     take_profit, profit_usd, profit_pct,
-                    is_profit, text[:500], "stat"
+                    is_profit, text[:500], "stat",
+                    delta_min, delta_max, is_observ
                 ])
                 parsed += 1
 
