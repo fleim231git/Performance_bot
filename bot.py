@@ -805,18 +805,22 @@ TOOLS = [
     },
     {
         "name": "get_delta_analysis",
-        "description": "Анализ прибыльности по 15-минутной абсолютной дельте. Показывает ROE и WR для каждого диапазона дельт. Используй для вопросов: при какой дельте лучше входить, какая дельта самая прибыльная для монеты/дистанса.",
+        "description": "Универсальный анализ по 15-минутной абсолютной дельте. group_by определяет разбивку: 'delta' (ROE по каждой дельте), 'coin' (ROE по монетам с лучшей дельтой), 'distance' (ROE по дистансам), 'combo' (топ комбинаций монета+дистанс+дельта). Используй для: при какой дельте лучше входить, лучшая комбинация для монеты, сравнение дельт по дистансам.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "coin": {"type": "string", "description": "Монета (опционально, если не указана — по всем)"},
-                "distance": {"type": "number", "description": "Дистанс для фильтрации (опционально)"},
+                "group_by": {"type": "string", "description": "Группировка: delta (по дельтам), coin (по монетам), distance (по дистансам), combo (монета+дистанс+дельта). По умолчанию delta"},
+                "coin": {"type": "string", "description": "Монета (опционально)"},
+                "distance": {"type": "number", "description": "Точный дистанс (опционально)"},
                 "min_distance": {"type": "number", "description": "Минимальный дистанс (опционально)"},
                 "max_distance": {"type": "number", "description": "Максимальный дистанс (опционально)"},
+                "delta_range": {"type": "string", "description": "Диапазон дельты, напр. '3-5' (опционально)"},
                 "side": {"type": "string", "description": "BUY или SELL (опционально)"},
                 "exchange": {"type": "string", "description": "Биржа: Binance, Bybit, OKX (опционально)"},
                 "since": {"type": "string", "description": "Дата начала (опционально)"},
                 "until": {"type": "string", "description": "Дата конца (опционально)"},
+                "limit": {"type": "integer", "description": "Кол-во результатов (по умолчанию 15)"},
+                "min_trades": {"type": "integer", "description": "Минимум сделок для включения (по умолчанию 10)"},
                 "source": SOURCE_PARAM
             }
         }
@@ -1252,14 +1256,18 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                     result += f"  {t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок WR={twr}%)\n"
 
         elif tool_name == "get_delta_analysis":
+            group_by = tool_input.get("group_by", "delta")
             coin = tool_input.get("coin")
             distance = tool_input.get("distance")
             min_dist = tool_input.get("min_distance")
             max_dist = tool_input.get("max_distance")
+            delta_range = tool_input.get("delta_range")
             side = tool_input.get("side")
             exchange = tool_input.get("exchange")
             since = tool_input.get("since")
             until = tool_input.get("until")
+            limit = tool_input.get("limit", 15)
+            min_trades = tool_input.get("min_trades", 10)
             source = tool_input.get("source")
 
             where = "WHERE delta_min IS NOT NULL"
@@ -1278,6 +1286,11 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             if max_dist:
                 where += " AND distance<=?"
                 params.append(max_dist)
+            if delta_range:
+                dr_parts = delta_range.split("-")
+                if len(dr_parts) == 2:
+                    where += " AND CAST(delta_min AS INTEGER)=? AND CAST(delta_max AS INTEGER)=?"
+                    params.extend([int(dr_parts[0]), int(dr_parts[1])])
             if side:
                 where += " AND side=?"
                 params.append(side.upper())
@@ -1294,29 +1307,6 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             is_stat = source == "stat"
 
-            # Группируем по диапазону дельт (delta_min-delta_max как текстовый ключ)
-            c.execute(f"""SELECT
-                         CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as delta_range,
-                         delta_min, delta_max,
-                         COUNT(*) as cnt,
-                         SUM(profit_usd) as total_pnl,
-                         SUM(profit_pct) as total_pct,
-                         SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END) as wins,
-                         AVG(distance) as avg_dist
-                         FROM trades {where}
-                         GROUP BY CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
-                         ORDER BY SUM(profit_pct) DESC""", params)
-            rows = c.fetchall()
-
-            if not rows:
-                return "Нет данных по дельтам для заданных фильтров."
-
-            total_cnt = sum(r[3] for r in rows)
-            total_pnl = sum(r[4] or 0 for r in rows)
-            total_pct = sum(r[5] or 0 for r in rows)
-            total_wins = sum(r[6] or 0 for r in rows)
-            total_wr = round(total_wins/total_cnt*100 if total_cnt > 0 else 0, 1)
-
             filters = []
             if coin: filters.append(f"#{coin}")
             if distance: filters.append(f"dist={distance}")
@@ -1324,30 +1314,115 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 if min_dist and max_dist: filters.append(f"dist {min_dist}-{max_dist}")
                 elif min_dist: filters.append(f"dist≥{min_dist}")
                 else: filters.append(f"dist≤{max_dist}")
+            if delta_range: filters.append(f"δ{delta_range}%")
             if side: filters.append(side.upper())
             if exchange: filters.append(exchange)
             filter_str = f" | {', '.join(filters)}" if filters else ""
 
-            result = f"АНАЛИЗ ПО 15-МИН ДЕЛЬТЕ{filter_str}\n"
-            if is_stat:
-                result += f"Всего: {total_cnt} сделок | ROE {'+' if total_pct>=0 else ''}{total_pct:.1f}% | WR {total_wr}%\n\n"
-            else:
-                result += f"Всего: {total_cnt} сделок | PnL {'+' if total_pnl>=0 else ''}{total_pnl:.2f}$ | WR {total_wr}%\n\n"
-
-            result += "Дельта | Сделок | ROE/PnL | WR | Avg dist\n"
-            result += "─" * 50 + "\n"
-            for dr, dmin, dmax, cnt, pnl, pct, wins, avg_d in rows:
-                wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
-                icon = "🟢" if (pct or 0) >= 0 else "🔴"
+            def fmt_val(pnl, pct):
                 if is_stat:
-                    val = f"ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}%"
-                else:
-                    val = f"{'+' if (pnl or 0)>=0 else ''}{(pnl or 0):.2f}$"
-                result += f"{icon} δ{dr}% | {cnt} | {val} | WR {wr}% | dist {avg_d:.2f}\n"
+                    return f"ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}%"
+                return f"{'+' if (pnl or 0)>=0 else ''}{(pnl or 0):.2f}$"
 
-            # Лучшая дельта
-            best = rows[0]
-            result += f"\n🏆 Лучшая дельта: {best[0]}% (ROE {'+' if (best[5] or 0)>=0 else ''}{(best[5] or 0):.1f}%, WR {round((best[6] or 0)/best[3]*100 if best[3]>0 else 0,1)}%, {best[3]} сделок)\n"
+            def fmt_wr(wins, cnt):
+                return f"{round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)}%"
+
+            if group_by == "delta":
+                c.execute(f"""SELECT
+                    CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER),
+                    COUNT(*), SUM(profit_usd), SUM(profit_pct),
+                    SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END), AVG(distance)
+                    FROM trades {where}
+                    GROUP BY CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                    HAVING COUNT(*) >= ?
+                    ORDER BY SUM(profit_pct) DESC""", params + [min_trades])
+                rows = c.fetchall()
+                if not rows:
+                    return "Нет данных по дельтам."
+                result = f"ДЕЛЬТЫ{filter_str}\n\n"
+                for dr, cnt, pnl, pct, wins, avg_d in rows:
+                    icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                    result += f"{icon} δ{dr}%: {fmt_val(pnl, pct)} | WR {fmt_wr(wins, cnt)} | dist avg {avg_d:.2f} | {cnt} сделок\n"
+                best = rows[0]
+                result += f"\n🏆 Лучшая: δ{best[0]}% ({fmt_val(best[2], best[3])}, WR {fmt_wr(best[4], best[1])}, {best[1]} сделок)\n"
+
+            elif group_by == "coin":
+                c.execute(f"""SELECT coin,
+                    CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
+                    COUNT(*), SUM(profit_pct),
+                    SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END), AVG(distance)
+                    FROM trades {where}
+                    GROUP BY coin, CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                    HAVING COUNT(*) >= ?
+                    ORDER BY SUM(profit_pct) DESC LIMIT ?""", params + [min_trades, limit * 5])
+                all_rows = c.fetchall()
+                if not all_rows:
+                    return "Нет данных."
+                # Для каждой монеты берём лучшую дельту
+                seen_coins = {}
+                for coin_r, dr, cnt, pct, wins, avg_d in all_rows:
+                    if coin_r not in seen_coins:
+                        seen_coins[coin_r] = (dr, cnt, pct, wins, avg_d)
+                sorted_coins = sorted(seen_coins.items(), key=lambda x: x[1][2] or 0, reverse=True)[:limit]
+                result = f"МОНЕТЫ + ЛУЧШАЯ ДЕЛЬТА{filter_str}\n\n"
+                for i, (coin_r, (dr, cnt, pct, wins, avg_d)) in enumerate(sorted_coins, 1):
+                    icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                    result += f"{i}. {icon} #{coin_r}: ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}% | δ{dr}% | WR {fmt_wr(wins, cnt)} | dist {avg_d:.2f} | {cnt} сделок\n"
+                # Для каждой монеты из топа — все дельты
+                result += f"\nДЕТАЛИ ПО ДЕЛЬТАМ:\n"
+                for coin_r, _ in sorted_coins[:5]:
+                    result += f"\n#{coin_r}:\n"
+                    coin_deltas = [(dr, cnt, pct, wins, avg_d) for c, dr, cnt, pct, wins, avg_d in all_rows if c == coin_r]
+                    coin_deltas.sort(key=lambda x: x[2] or 0, reverse=True)
+                    for dr, cnt, pct, wins, avg_d in coin_deltas:
+                        icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                        result += f"  {icon} δ{dr}%: ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}% | WR {fmt_wr(wins, cnt)} | {cnt} сделок\n"
+
+            elif group_by == "distance":
+                c.execute(f"""SELECT distance,
+                    CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
+                    COUNT(*), SUM(profit_pct),
+                    SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                    FROM trades {where}
+                    GROUP BY distance, CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                    HAVING COUNT(*) >= ?
+                    ORDER BY distance, SUM(profit_pct) DESC""", params + [min_trades])
+                rows = c.fetchall()
+                if not rows:
+                    return "Нет данных."
+                from itertools import groupby as igroupby
+                result = f"ДИСТАНСЫ + ДЕЛЬТЫ{filter_str}\n\n"
+                rows_sorted = sorted(rows, key=lambda x: x[0] or 0)
+                for dist_val, group in igroupby(rows_sorted, key=lambda x: x[0]):
+                    group_list = sorted(list(group), key=lambda x: x[3] or 0, reverse=True)
+                    total_pct = sum(r[3] or 0 for r in group_list)
+                    total_cnt = sum(r[2] for r in group_list)
+                    icon = "🟢" if total_pct >= 0 else "🔴"
+                    result += f"{icon} dist={fmt_dist(dist_val)}: ROE {'+' if total_pct>=0 else ''}{total_pct:.1f}% | {total_cnt} сделок\n"
+                    for dist_r, dr, cnt, pct, wins in group_list[:4]:
+                        sub_icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                        result += f"  {sub_icon} δ{dr}%: ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}% | WR {fmt_wr(wins, cnt)} | {cnt} сделок\n"
+
+            elif group_by == "combo":
+                c.execute(f"""SELECT coin, distance,
+                    CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
+                    COUNT(*), SUM(profit_usd), SUM(profit_pct),
+                    SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                    FROM trades {where}
+                    GROUP BY coin, distance, CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                    HAVING COUNT(*) >= ?
+                    ORDER BY SUM(profit_pct) DESC LIMIT ?""", params + [min_trades, limit])
+                rows = c.fetchall()
+                if not rows:
+                    return "Нет данных для комбо-анализа."
+                result = f"ТОП КОМБИНАЦИЙ монета+дистанс+дельта{filter_str}\n\n"
+                for i, (coin_r, dist_r, dr, cnt, pnl, pct, wins) in enumerate(rows, 1):
+                    icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                    result += f"{i}. {icon} #{coin_r} dist={fmt_dist(dist_r)} δ{dr}%: {fmt_val(pnl, pct)} | WR {fmt_wr(wins, cnt)} | {cnt} сделок\n"
+                result += f"\n🏆 Лучшая: #{rows[0][0]} dist={fmt_dist(rows[0][1])} δ{rows[0][2]}%\n"
+
+            else:
+                result = f"Неизвестный group_by: {group_by}. Используй: delta, coin, distance, combo"
 
     except Exception as e:
         result = f"Ошибка запроса: {e}"
