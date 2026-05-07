@@ -2462,6 +2462,23 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(r, parse_mode="Markdown")
 
 
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет БД файлом в Telegram."""
+    if not os.path.exists(DB_PATH):
+        await update.message.reply_text("БД не найдена.")
+        return
+    size_mb = os.path.getsize(DB_PATH) / (1024 * 1024)
+    await update.message.reply_text(f"Отправляю БД ({size_mb:.1f} MB)...")
+    try:
+        await update.message.reply_document(
+            document=open(DB_PATH, "rb"),
+            filename=f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+            caption=f"trades.db | {size_mb:.1f} MB | {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📖 *Команды бота:*\n\n"
@@ -2479,6 +2496,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/coin BTCUSDT март 2026 okx — монета на OKX\n"
         "/stats — общая статистика\n"
         "/cost — расходы на AI API\n"
+        "/export — скачать БД (SQLite файл)\n"
         "/clear — очистить историю AI-диалога\n\n"
         f"💬 Упомяни @{BOT_USERNAME} или ответь на моё сообщение для AI-диалога.\n"
         f"🌐 Поиск в интернете: просто попроси 'найди новости по BTC' или 'поищи что случилось с AAVE'"
@@ -2542,6 +2560,7 @@ async def main():
     app.add_handler(CommandHandler("top",          cmd_top))
     app.add_handler(CommandHandler("stats",        cmd_stats))
     app.add_handler(CommandHandler("cost",         cmd_cost))
+    app.add_handler(CommandHandler("export",       cmd_export))
     app.add_handler(CommandHandler("clear",        cmd_clear_history))
     app.add_handler(CommandHandler("help",         cmd_help))
     app.add_handler(CommandHandler("start",        cmd_help))
