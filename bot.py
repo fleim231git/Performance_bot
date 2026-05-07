@@ -1024,11 +1024,6 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             cnt, pnl, wins, dist, dmin, dmax, buf, sum_pct = row
             wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
 
-            c.execute(f"""SELECT trader, SUM(profit_usd), COUNT(*), AVG(distance), SUM(profit_pct)
-                         FROM trades {where}
-                         GROUP BY trader ORDER BY SUM(profit_usd) DESC LIMIT 5""", params)
-            traders = c.fetchall()
-
             result = f"Монета: #{coin}\n"
             if is_stat:
                 result += f"Сделок: {cnt} | ROE {'+' if (sum_pct or 0)>=0 else ''}{(sum_pct or 0):.1f}% | WR: {wr}%\n"
@@ -1042,14 +1037,42 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 else:
                     result += f"Дистанс: avg={fmt_dist(dist)} min={dmin_s} max={fmt_dist(dmax)}\n"
             if buf: result += f"Буфер: avg={fmt_dist(buf)}\n"
-            result += "\nТоп трейдеры:\n"
-            for t, p, n, d, t_sum_pct in traders:
-                if is_stat:
-                    result += f"{t}: ROE {'+' if (t_sum_pct or 0)>=0 else ''}{(t_sum_pct or 0):.1f}% ({n} сделок)"
-                else:
+            if not is_stat:
+                c.execute(f"""SELECT trader, SUM(profit_usd), COUNT(*), AVG(distance)
+                             FROM trades {where}
+                             GROUP BY trader ORDER BY SUM(profit_usd) DESC LIMIT 5""", params)
+                traders = c.fetchall()
+                result += "\nТоп трейдеры:\n"
+                for t, p, n, d in traders:
                     result += f"{t}: {'+' if p>=0 else ''}{(p or 0):.2f}$ ({n} сделок)"
-                if d: result += f" dist={fmt_dist(d)}"
-                result += "\n"
+                    if d: result += f" dist={fmt_dist(d)}"
+                    result += "\n"
+
+            # Разбивка по дистанс + дельта (только для stat данных)
+            if is_stat:
+                c.execute(f"""SELECT distance,
+                    CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
+                    COUNT(*), SUM(profit_pct),
+                    SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                    FROM trades {where} AND delta_min IS NOT NULL
+                    GROUP BY distance, CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                    HAVING COUNT(*) >= 5
+                    ORDER BY distance, SUM(profit_pct) DESC""", params)
+                delta_rows = c.fetchall()
+                if delta_rows:
+                    from itertools import groupby as igroupby
+                    result += "\nROE ПО ДИСТАНСАМ И ДЕЛЬТАМ:\n"
+                    sorted_dr = sorted(delta_rows, key=lambda x: x[0] or 0)
+                    for dist_val, group in igroupby(sorted_dr, key=lambda x: x[0]):
+                        gl = sorted(list(group), key=lambda x: x[3] or 0, reverse=True)
+                        total_pct = sum(r[3] or 0 for r in gl)
+                        total_cnt = sum(r[2] for r in gl)
+                        icon = "🟢" if total_pct >= 0 else "🔴"
+                        result += f"\n{icon} dist={fmt_dist(dist_val)}: ROE {'+' if total_pct>=0 else ''}{total_pct:.1f}% ({total_cnt} сделок)\n"
+                        for _, dr, cnt, pct, wins in gl:
+                            wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
+                            sub_icon = "🟢" if (pct or 0) >= 0 else "🔴"
+                            result += f"  {sub_icon} δ{dr}%: ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}% | WR {wr}% | {cnt} сделок\n"
 
         elif tool_name == "get_top_coins":
             since = tool_input.get("since")
