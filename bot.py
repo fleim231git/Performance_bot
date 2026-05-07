@@ -2255,6 +2255,14 @@ async def main():
     app.add_handler(CommandHandler("start",        cmd_help))
     trade_chat_ids = [SOURCE_CHAT_ID] + list(STAT_CHAT_IDS)
     app.add_handler(MessageHandler(filters.Chat(trade_chat_ids) & filters.ALL, handle_trade_message))
+    # Catch-all для обнаружения новых чатов (если STAT_CHAT_IDS ещё не настроен)
+    if not STAT_CHAT_IDS:
+        async def log_unknown(update, context):
+            msg = update.channel_post or update.message
+            if msg and msg.chat.id != SOURCE_CHAT_ID and msg.chat.id != DIALOG_CHAT_ID:
+                text = msg.text or ""
+                logger.info(f"⚠️ Unknown chat_id={msg.chat.id} type={msg.chat.type} | {text[:100]}")
+        app.add_handler(MessageHandler(filters.ALL, log_unknown))
     app.add_handler(MessageHandler(filters.Chat(DIALOG_CHAT_ID) & filters.TEXT & ~filters.COMMAND, handle_dialog_message))
     app.add_handler(MessageHandler(filters.Chat(DIALOG_CHAT_ID) & (filters.VOICE | filters.AUDIO), handle_dialog_message))
     app.add_error_handler(error_handler)
