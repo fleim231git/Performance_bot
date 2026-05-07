@@ -649,6 +649,8 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - Timestamp хранится с точностью до секунды
 - "за последний час" → get_period_stats с since = текущее время − 1 час
 - "с 18:00" → since = сегодня T18:00:00
+- ВСЕГДА указывай в ответе за какой период данные (например: "за 26.08.2025 — 07.05.2026" или "за последние 7 дней")
+- Если пользователь не указал период — укажи "за весь период (дата — дата)" в ответе
 
 ━━━ ПРАВИЛО 9 — ПАМЯТЬ И ОБУЧЕНИЕ ━━━
 - manage_knowledge — сохраняй заметки когда пользователь говорит "запомни", "правило:", "заметка:"
@@ -1015,16 +1017,18 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             c.execute(f"""SELECT COUNT(*), SUM(profit_usd),
                          SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END),
                          AVG(distance), MIN(distance), MAX(distance), AVG(buffer),
-                         SUM(profit_pct)
+                         SUM(profit_pct),
+                         MIN(timestamp), MAX(timestamp)
                          FROM trades {where}""", params)
             row = c.fetchone()
             if not row or not row[0]:
                 return f"Монета {coin} не найдена."
 
-            cnt, pnl, wins, dist, dmin, dmax, buf, sum_pct = row
+            cnt, pnl, wins, dist, dmin, dmax, buf, sum_pct, ts_min, ts_max = row
             wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
 
             result = f"Монета: #{coin}\n"
+            result += f"Период: {ts_min[:10] if ts_min else '?'} — {ts_max[:10] if ts_max else '?'}\n"
             if is_stat:
                 result += f"Сделок: {cnt} | ROE {'+' if (sum_pct or 0)>=0 else ''}{(sum_pct or 0):.1f}% | WR: {wr}%\n"
             else:
@@ -1153,7 +1157,13 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             loss_lines   = [fmt_coin_row(*row) for _, row in loss_rows]
             total_coins  = len(profit_lines) + len(loss_lines)
 
+            # Период данных
+            c.execute(f"SELECT MIN(timestamp), MAX(timestamp) FROM trades {where_base}", params)
+            ts_row = c.fetchone()
+            period_str = f"{ts_row[0][:10] if ts_row and ts_row[0] else '?'} — {ts_row[1][:10] if ts_row and ts_row[1] else '?'}"
+
             result = f"[ДАННЫЕ ДЛЯ ОТВЕТА]\n"
+            result += f"Период: {period_str}\n"
             result += f"Список содержит ровно {total_coins} монет{dist_filter}. Пиши {total_coins} в заголовке.\n\n"
 
             if profit_lines:
