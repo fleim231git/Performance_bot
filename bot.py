@@ -1054,13 +1054,15 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             # Разбивка по дистанс + дельта (только для stat данных)
             if is_stat:
+                # Адаптивный порог: min 1 для маленьких выборок, max 5 для больших
+                min_having = max(1, min(5, cnt // 20))
                 c.execute(f"""SELECT distance,
                     CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
                     COUNT(*), SUM(profit_pct),
                     SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
                     FROM trades {where} AND delta_min IS NOT NULL
                     GROUP BY distance, CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
-                    HAVING COUNT(*) >= 5
+                    HAVING COUNT(*) >= {min_having}
                     ORDER BY distance, SUM(profit_pct) DESC""", params)
                 delta_rows = c.fetchall()
                 if delta_rows:
@@ -1073,10 +1075,16 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                         total_cnt = sum(r[2] for r in gl)
                         icon = "🟢" if total_pct >= 0 else "🔴"
                         result += f"\n{icon} dist={fmt_dist(dist_val)}: ROE {'+' if total_pct>=0 else ''}{total_pct:.1f}% ({total_cnt} сделок)\n"
-                        for _, dr, cnt, pct, wins in gl:
-                            wr = round((wins or 0)/cnt*100 if cnt > 0 else 0, 1)
+                        for _, dr, cnt_d, pct, wins in gl:
+                            wr = round((wins or 0)/cnt_d*100 if cnt_d > 0 else 0, 1)
                             sub_icon = "🟢" if (pct or 0) >= 0 else "🔴"
-                            result += f"  {sub_icon} δ{dr}%: ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}% | WR {wr}% | {cnt} сделок\n"
+                            result += f"  {sub_icon} δ{dr}%: ROE {'+' if (pct or 0)>=0 else ''}{(pct or 0):.1f}% | WR {wr}% | {cnt_d} сделок\n"
+                else:
+                    # Нет данных с дельтами вообще
+                    c.execute(f"SELECT COUNT(*) FROM trades {where} AND delta_min IS NOT NULL", params)
+                    delta_cnt = c.fetchone()[0]
+                    if delta_cnt == 0:
+                        result += "\nДельты: нет данных (сделки без дельт)\n"
 
         elif tool_name == "get_top_coins":
             since = tool_input.get("since")
