@@ -635,8 +635,19 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - Stat-аккаунты торгуют на маленьком ордер-сайзе — PnL в $ НЕ показывать для stat, НИКОГДА
 - Для stat показывай ТОЛЬКО profit_pct (%) — это ROE. Доллары для stat ЗАПРЕЩЕНЫ
 - Формат для stat: #COIN ROE +29.8% | dist=0.85% | 50 сделок
-- КРИТИЧНО: для stat данных ВСЕГДА показывай дельта-разбивку из ответа tool. Это главная ценность stat данных
-- Если tool вернул "ROE ПО ДИСТАНСАМ И ДЕЛЬТАМ" или "Топ дельты" — ОБЯЗАТЕЛЬНО включи это в ответ целиком
+
+━━━ ПРАВИЛО 7.1 — ДЕЛЬТА-РАЗБИВКА (главная ценность stat данных) ━━━
+- Для stat данных ВСЕГДА показывай дельта-разбивку из ответа tool ЦЕЛИКОМ
+- ROE монеты — это СУММА всех дельт-диапазонов. Пример:
+  #COLLECTUSDT — ROE +439.5% (суммарно, 202 сделки)
+    dist=0.70% δ0-1%: ROE +50.2% | WR 75% | 30 сделок
+    dist=0.70% δ1-2%: ROE +80.1% | WR 70% | 40 сделок
+    dist=1.00% δ3-5%: ROE +122.8% | WR 68% | 88 сделок
+    dist=1.00% δ5-9%: ROE +186.4% | WR 86% | 22 сделок
+- НЕ показывай только "лучшую" дельту — показывай ВСЕ из ответа tool
+- Если tool вернул "ROE ПО ДИСТАНСАМ И ДЕЛЬТАМ" или "ДЕЛЬТЫ ПО МОНЕТАМ" — копируй ЦЕЛИКОМ
+- НЕ выдумывай данные по дельтам. Если tool не вернул разбивку — пиши "нет данных по дельтам"
+- Stat без дельт = бесполезный ответ. Дельты — это ОСНОВНАЯ причина зачем нужны stat данные
 
 ━━━ ПРАВИЛО 8 — ДЕЛЬТЫ (15-мин абсолютная дельта) ━━━
 - Дельта — процент изменения цены за 15-минутный период в момент входа в сделку
@@ -1159,8 +1170,12 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                 line += f" ({cnt} сделок)"
                 return line
 
-            profit_rows = [(i, r) for i, r in enumerate(rows, 1) if (r[1] or 0) >= 0]
-            loss_rows   = [(i, r) for i, r in enumerate(rows, 1) if (r[1] or 0) < 0]
+            if is_stat:
+                profit_rows = [(i, r) for i, r in enumerate(rows, 1) if (r[8] or 0) >= 0]
+                loss_rows   = [(i, r) for i, r in enumerate(rows, 1) if (r[8] or 0) < 0]
+            else:
+                profit_rows = [(i, r) for i, r in enumerate(rows, 1) if (r[1] or 0) >= 0]
+                loss_rows   = [(i, r) for i, r in enumerate(rows, 1) if (r[1] or 0) < 0]
 
             profit_lines = [fmt_coin_row(*row) for _, row in profit_rows]
             loss_lines   = [fmt_coin_row(*row) for _, row in loss_rows]
@@ -1187,38 +1202,65 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             result += f"\nИТОГО В СПИСКЕ: {total_coins} монет\n"
 
-            all_dist_data = []
-            for coin, pnl, cnt, dist, dmin, dmax, buf, wins, _avg_pct in rows:
-                if dist:
-                    dd = get_smart_distance(conn, where_dist, params_dist, coin)
-                    if dd:
-                        all_dist_data.append((coin, dd, pnl))
+            if is_stat:
+                # Дельта-разбивка для каждой монеты в топе
+                result += "\nДЕЛЬТЫ ПО МОНЕТАМ:\n"
+                for coin_r, pnl_r, cnt_r, dist_r, dmin_r, dmax_r, buf_r, wins_r, spct_r in rows:
+                    min_h = max(1, min(5, cnt_r // 20))
+                    c.execute(f"""SELECT distance,
+                        CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
+                        COUNT(*), SUM(profit_pct),
+                        SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                        FROM trades {where_base} AND coin=? AND delta_min IS NOT NULL
+                        GROUP BY distance, CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
+                        HAVING COUNT(*) >= {min_h}
+                        ORDER BY SUM(profit_pct) DESC""", params + [coin_r])
+                    d_rows = c.fetchall()
+                    if d_rows:
+                        from itertools import groupby as igroupby
+                        result += f"\n#{coin_r} (ROE {'+' if (spct_r or 0)>=0 else ''}{(spct_r or 0):.1f}% суммарно):\n"
+                        sorted_d = sorted(d_rows, key=lambda x: x[0] or 0)
+                        for dist_val, group in igroupby(sorted_d, key=lambda x: x[0]):
+                            gl = sorted(list(group), key=lambda x: x[3] or 0, reverse=True)
+                            for _, dr, cnt_d, pct_d, wins_d in gl:
+                                dwr = round((wins_d or 0)/cnt_d*100 if cnt_d > 0 else 0, 1)
+                                icon = "🟢" if (pct_d or 0) >= 0 else "🔴"
+                                result += f"  {icon} dist={fmt_dist(dist_val)} δ{dr}%: ROE {'+' if (pct_d or 0)>=0 else ''}{(pct_d or 0):.1f}% | WR {dwr}% | {cnt_d} сделок\n"
+                    else:
+                        result += f"\n#{coin_r}: нет данных с дельтами\n"
+            else:
+                all_dist_data = []
+                for coin, pnl, cnt, dist, dmin, dmax, buf, wins, _avg_pct in rows:
+                    if dist:
+                        dd = get_smart_distance(conn, where_dist, params_dist, coin)
+                        if dd:
+                            all_dist_data.append((coin, dd, pnl))
 
-            if all_dist_data:
-                min_entry = min(all_dist_data, key=lambda x: x[1]["min"])
-                max_entry = max(all_dist_data, key=lambda x: x[1]["max"])
-                stable = sorted([x for x in all_dist_data if x[1]["spread"] <= 3],
-                                 key=lambda x: x[1]["spread"])
+                if all_dist_data:
+                    min_entry = min(all_dist_data, key=lambda x: x[1]["min"])
+                    max_entry = max(all_dist_data, key=lambda x: x[1]["max"])
+                    stable = sorted([x for x in all_dist_data if x[1]["spread"] <= 3],
+                                     key=lambda x: x[1]["spread"])
 
-                result += "\nАНАЛИЗ ДИСТАНСОВ:\n"
-                result += f"Мин. дистанс: #{min_entry[0]} от {fmt_dist(min_entry[1]['min'])}\n"
-                result += f"Макс. дистанс: #{max_entry[0]} до {fmt_dist(max_entry[1]['max'])}\n"
-                if stable:
-                    result += "Стабильные дистансы (разброс ≤3%):\n"
-                    for coin, dd, _ in stable[:3]:
-                        result += f"  #{coin}: {fmt_dist(dd['min'])}—{fmt_dist(dd['max'])} (разброс {dd['spread']:.2f}%)\n"
+                    result += "\nАНАЛИЗ ДИСТАНСОВ:\n"
+                    result += f"Мин. дистанс: #{min_entry[0]} от {fmt_dist(min_entry[1]['min'])}\n"
+                    result += f"Макс. дистанс: #{max_entry[0]} до {fmt_dist(max_entry[1]['max'])}\n"
+                    if stable:
+                        result += "Стабильные дистансы (разброс ≤3%):\n"
+                        for coin, dd, _ in stable[:3]:
+                            result += f"  #{coin}: {fmt_dist(dd['min'])}—{fmt_dist(dd['max'])} (разброс {dd['spread']:.2f}%)\n"
 
-            EXCHANGES = ["Binance", "Bybit", "OKX"]
-            result += "\nДИСТАНСЫ ПО БИРЖАМ:\n"
-            for coin, pnl, cnt, dist, dmin, dmax, buf, wins, _avg_pct in rows[:5]:
-                result += f"#{coin}:\n"
-                for exch in EXCHANGES:
-                    w_exch = where_base + " AND exchange=?"
-                    p_exch = list(params) + [exch]
-                    dd = get_smart_distance(conn, w_exch, p_exch, coin)
-                    if dd:
-                        dist_str = fmt_dist_info(dd)
-                        result += f"  {exch}:{dist_str}\n"
+                EXCHANGES = ["Binance", "Bybit", "OKX"]
+                result += "\nДИСТАНСЫ ПО БИРЖАМ:\n"
+                for coin, pnl, cnt, dist, dmin, dmax, buf, wins, _avg_pct in rows[:5]:
+                    result += f"#{coin}:\n"
+                    for exch in EXCHANGES:
+                        w_exch = where_base + " AND exchange=?"
+                        p_exch = list(params) + [exch]
+                        dd = get_smart_distance(conn, w_exch, p_exch, coin)
+                        if dd:
+                            dist_str = fmt_dist_info(dd)
+                            result += f"  {exch}:{dist_str}\n"
 
         elif tool_name == "get_all_traders":
             since = tool_input.get("since")
