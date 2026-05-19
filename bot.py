@@ -599,9 +599,10 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 
 ━━━ ПРАВИЛО 3 — ДИСТАНСЫ ━━━
 - Дистанс и буфер — проценты. Всегда пиши % : "1.93%", "0.77%"
-- ⚡️ = рабочий дистанс (медиана прибыльных сделок)
+- ⚡️ = рабочий дистанс (самый прибыльный дистанс за период)
 - 🛡 = страховочный дистанс (90-й перцентиль) — выше нет смысла ставить
 - 🎯 = стабильный дистанс (разброс ≤3%)
+- 💰best = дистанс с максимальным суммарным профитом + его ROE/PnL и WR
 - Копируй дистансы из tool точно как написаны — не пересчитывай
 
 ━━━ ПРАВИЛО 4 — ФОРМАТ ОТВЕТА ━━━
@@ -726,9 +727,6 @@ def get_smart_distance(conn, where: str, params: list, coin: str) -> dict | None
     coin_where = where + " AND coin=? AND distance>0 AND distance IS NOT NULL"
     coin_params = params + [coin]
 
-    c2.execute(f"SELECT distance FROM trades {coin_where} AND is_profit=1 ORDER BY distance", coin_params)
-    profit_dists = [r[0] for r in c2.fetchall()]
-
     c2.execute(f"SELECT distance FROM trades {coin_where} ORDER BY distance", coin_params)
     all_dists = [r[0] for r in c2.fetchall()]
 
@@ -739,18 +737,35 @@ def get_smart_distance(conn, where: str, params: list, coin: str) -> dict | None
     dmax = max(all_dists)
     spread = dmax - dmin
 
-    if spread <= 3:
-        avg = sum(all_dists) / len(all_dists)
-        return {"avg": avg, "min": dmin, "max": dmax, "spread": spread, "smart": False}
+    # Самый прибыльный дистанс: группируем по distance, берём с макс. SUM(profit_usd)
+    c2.execute(f"""SELECT distance, SUM(profit_usd), SUM(profit_pct), COUNT(*),
+                   SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+                   FROM trades {coin_where}
+                   GROUP BY distance HAVING COUNT(*) >= 2
+                   ORDER BY SUM(profit_usd) DESC""", coin_params)
+    dist_rows = c2.fetchall()
 
-    if profit_dists:
-        n = len(profit_dists)
-        if n % 2 == 1:
-            working = profit_dists[n // 2]
-        else:
-            working = (profit_dists[n // 2 - 1] + profit_dists[n // 2]) / 2
+    # Проверяем source: если profit_usd мал, сортируем по profit_pct (stat)
+    is_stat = all(abs(r[1] or 0) < 0.01 for r in dist_rows[:3]) if dist_rows else False
+    if is_stat and dist_rows:
+        dist_rows = sorted(dist_rows, key=lambda r: r[2] or 0, reverse=True)
+
+    if dist_rows:
+        best = dist_rows[0]
+        working = best[0]
+        best_profit = best[2] if is_stat else best[1]
+        best_cnt = best[3]
+        best_wr = round((best[4] or 0) / best[3] * 100, 1) if best[3] > 0 else 0
     else:
         working = sum(all_dists) / len(all_dists)
+        best_profit = None
+        best_cnt = 0
+        best_wr = 0
+
+    if spread <= 3:
+        avg = sum(all_dists) / len(all_dists)
+        return {"avg": avg, "min": dmin, "max": dmax, "spread": spread, "smart": False,
+                "best_dist": working, "best_profit": best_profit, "best_cnt": best_cnt, "best_wr": best_wr, "is_stat": is_stat}
 
     idx = int(len(all_dists) * 0.9)
     insurance = all_dists[min(idx, len(all_dists) - 1)]
@@ -760,7 +775,8 @@ def get_smart_distance(conn, where: str, params: list, coin: str) -> dict | None
         "avg": sum(all_dists) / len(all_dists),
         "min": dmin, "max": dmax, "spread": spread,
         "working": working, "insurance": insurance,
-        "smart": True
+        "smart": True,
+        "best_profit": best_profit, "best_cnt": best_cnt, "best_wr": best_wr, "is_stat": is_stat
     }
 
 
@@ -773,11 +789,23 @@ def fmt_dist(d: float | None) -> str:
 def fmt_dist_info(dist_data: dict | None) -> str:
     if not dist_data:
         return ""
+    bp = dist_data.get("best_profit")
+    bc = dist_data.get("best_cnt", 0)
+    bwr = dist_data.get("best_wr", 0)
+    is_stat = dist_data.get("is_stat", False)
+
     if dist_data.get("smart"):
-        return (f" ⚡️{fmt_dist(dist_data['working'])} 🛡{fmt_dist(dist_data['insurance'])}"
+        line = (f" ⚡️{fmt_dist(dist_data['working'])} 🛡{fmt_dist(dist_data['insurance'])}"
                 f" ({fmt_dist(dist_data['min'])}–{fmt_dist(dist_data['max'])})")
     else:
-        return f" 🎯{fmt_dist(dist_data['avg'])} ({fmt_dist(dist_data['min'])}–{fmt_dist(dist_data['max'])})"
+        line = f" 🎯{fmt_dist(dist_data['avg'])} ({fmt_dist(dist_data['min'])}–{fmt_dist(dist_data['max'])})"
+
+    if bp is not None and bc >= 2:
+        if is_stat:
+            line += f" | 💰best={fmt_dist(dist_data['working'])} ROE {'+' if bp>=0 else ''}{bp:.1f}% WR {bwr}%"
+        else:
+            line += f" | 💰best={fmt_dist(dist_data['working'])} {'+' if bp>=0 else ''}{bp:.2f}$ WR {bwr}%"
+    return line
 
 
 # ─── TOOLS для Claude ─────────────────────────────────────────────────────────
