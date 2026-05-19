@@ -722,10 +722,10 @@ def get_distance_stats(since: str, until: str = None) -> str:
     return r
 
 
-def get_smart_distance(conn, where: str, params: list, coin: str) -> dict | None:
+def get_smart_distance(conn, where: str, params, coin: str) -> dict | None:
     c2 = conn.cursor()
     coin_where = where + " AND coin=? AND distance>0 AND distance IS NOT NULL"
-    coin_params = params + [coin]
+    coin_params = list(params) + [coin]
 
     c2.execute(f"SELECT distance FROM trades {coin_where} ORDER BY distance", coin_params)
     all_dists = [r[0] for r in c2.fetchall()]
