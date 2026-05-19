@@ -765,7 +765,7 @@ def get_smart_distance(conn, where: str, params, coin: str) -> dict | None:
     if spread <= 3:
         avg = sum(all_dists) / len(all_dists)
         return {"avg": avg, "min": dmin, "max": dmax, "spread": spread, "smart": False,
-                "best_dist": working, "best_profit": best_profit, "best_cnt": best_cnt, "best_wr": best_wr, "is_stat": is_stat}
+                "working": working, "best_profit": best_profit, "best_cnt": best_cnt, "best_wr": best_wr, "is_stat": is_stat}
 
     idx = int(len(all_dists) * 0.9)
     insurance = all_dists[min(idx, len(all_dists) - 1)]
@@ -801,10 +801,11 @@ def fmt_dist_info(dist_data: dict | None) -> str:
         line = f" 🎯{fmt_dist(dist_data['avg'])} ({fmt_dist(dist_data['min'])}–{fmt_dist(dist_data['max'])})"
 
     if bp is not None and bc >= 2:
+        best_d = dist_data.get("working") or dist_data.get("best_dist") or dist_data.get("avg")
         if is_stat:
-            line += f" | 💰best={fmt_dist(dist_data['working'])} ROE {'+' if bp>=0 else ''}{bp:.1f}% WR {bwr}%"
+            line += f" | 💰best={fmt_dist(best_d)} ROE {'+' if bp>=0 else ''}{bp:.1f}% WR {bwr}%"
         else:
-            line += f" | 💰best={fmt_dist(dist_data['working'])} {'+' if bp>=0 else ''}{bp:.2f}$ WR {bwr}%"
+            line += f" | 💰best={fmt_dist(best_d)} {'+' if bp>=0 else ''}{bp:.2f}$ WR {bwr}%"
     return line
 
 
