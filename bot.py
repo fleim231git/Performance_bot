@@ -964,28 +964,56 @@ def parse_dt(dt_str: str, end_of_day: bool = False) -> str:
 
 def fetch_exchange_listings() -> dict[str, set[str]]:
     import httpx
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     result = {}
-    try:
-        r = httpx.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10)
-        symbols = r.json().get("symbols", [])
-        result["Binance"] = {s["symbol"] for s in symbols if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"}
-    except Exception as e:
-        logger.error(f"Binance API error: {e}")
+
+    # Binance — пробуем несколько эндпоинтов
+    for url in ["https://fapi.binance.com/fapi/v1/exchangeInfo", "https://fapi.binance.me/fapi/v1/exchangeInfo"]:
+        try:
+            r = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
+            if r.status_code == 200:
+                symbols = r.json().get("symbols", [])
+                result["Binance"] = {s["symbol"] for s in symbols if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"}
+                logger.info(f"Binance listings: {len(result['Binance'])} from {url}")
+                break
+        except Exception as e:
+            logger.error(f"Binance API error ({url}): {e}")
+    if "Binance" not in result:
         result["Binance"] = set()
+
+    # Bybit — пагинация через cursor
+    bybit_coins = set()
+    cursor = ""
+    for _ in range(5):
+        try:
+            url = f"https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
+            if cursor:
+                url += f"&cursor={cursor}"
+            r = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
+            if r.status_code != 200:
+                break
+            data = r.json().get("result", {})
+            items = data.get("list", [])
+            bybit_coins |= {i["symbol"] for i in items if i.get("status") == "Trading"}
+            cursor = data.get("nextPageCursor", "")
+            if not cursor or not items:
+                break
+        except Exception as e:
+            logger.error(f"Bybit API error: {e}")
+            break
+    result["Bybit"] = bybit_coins
+    logger.info(f"Bybit listings: {len(bybit_coins)}")
+
+    # OKX
     try:
-        r = httpx.get("https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000", timeout=10)
-        items = r.json().get("result", {}).get("list", [])
-        result["Bybit"] = {i["symbol"] for i in items if i.get("status") == "Trading"}
-    except Exception as e:
-        logger.error(f"Bybit API error: {e}")
-        result["Bybit"] = set()
-    try:
-        r = httpx.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", timeout=10)
+        r = httpx.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", headers=headers, timeout=15, follow_redirects=True)
         items = r.json().get("data", [])
         result["OKX"] = {i["instId"].replace("-USDT-SWAP", "USDT") for i in items if "USDT" in i.get("instId", "") and i.get("state") == "live"}
+        logger.info(f"OKX listings: {len(result['OKX'])}")
     except Exception as e:
         logger.error(f"OKX API error: {e}")
         result["OKX"] = set()
+
     return result
 
 
