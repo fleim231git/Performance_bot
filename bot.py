@@ -672,7 +672,14 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - Если в ФИДБЕК есть замечания — учитывай их
 - Пользователь может оценить ответ: 👍/👎/+/- или "плохо: причина"
 
-━━━ ПРАВИЛО 10 — ПОИСК В ИНТЕРНЕТЕ ━━━
+━━━ ПРАВИЛО 10 — ЛИСТИНГИ БИРЖ ━━━
+- Используй get_exchange_listings когда спрашивают про наличие монет на биржах
+- "какие монеты есть на Binance но нет на Bybit" → mode="compare"
+- "список монет на OKX" → mode="list", exchange="OKX"
+- Данные берутся напрямую с API бирж (Binance, Bybit, OKX) — актуальные
+- НЕ используй базу сделок для этих вопросов — база содержит только монеты по которым были сделки
+
+━━━ ПРАВИЛО 11 — ПОИСК В ИНТЕРНЕТЕ ━━━
 - Используй web_search когда пользователь просит найти что-то в интернете
 - Например: "найди новости по BTC", "что случилось с AAVE", "поищи эксплойт KelpDAO"
 - Если монеты НЕТ в базе и пользователь спрашивает про неё — используй web_search чтобы найти информацию
@@ -928,6 +935,19 @@ TOOLS = [
         "type": "web_search_20250305",
         "name": "web_search",
         "max_uses": 3
+    },
+    # ─── EXCHANGE LISTINGS ────────────────────────────────────────────────────
+    {
+        "name": "get_exchange_listings",
+        "description": "Получить списки фьючерсных монет с бирж Binance/Bybit/OKX и сравнить. Показывает какие монеты есть на одной бирже но нет на других.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["compare", "list"], "description": "compare = сравнить биржи и показать уникальные монеты. list = показать все монеты конкретной биржи"},
+                "exchange": {"type": "string", "description": "Биржа для mode=list (Binance, Bybit, OKX)"}
+            },
+            "required": ["mode"]
+        }
     }
 ]
 
@@ -940,6 +960,33 @@ def parse_dt(dt_str: str, end_of_day: bool = False) -> str:
     if end_of_day:
         return dt_str + "T23:59:59"
     return dt_str + "T00:00:00"
+
+
+def fetch_exchange_listings() -> dict[str, set[str]]:
+    import httpx
+    result = {}
+    try:
+        r = httpx.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10)
+        symbols = r.json().get("symbols", [])
+        result["Binance"] = {s["symbol"] for s in symbols if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"}
+    except Exception as e:
+        logger.error(f"Binance API error: {e}")
+        result["Binance"] = set()
+    try:
+        r = httpx.get("https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000", timeout=10)
+        items = r.json().get("result", {}).get("list", [])
+        result["Bybit"] = {i["symbol"] for i in items if i.get("status") == "Trading"}
+    except Exception as e:
+        logger.error(f"Bybit API error: {e}")
+        result["Bybit"] = set()
+    try:
+        r = httpx.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", timeout=10)
+        items = r.json().get("data", [])
+        result["OKX"] = {i["instId"].replace("-USDT-SWAP", "USDT") for i in items if "USDT" in i.get("instId", "") and i.get("state") == "live"}
+    except Exception as e:
+        logger.error(f"OKX API error: {e}")
+        result["OKX"] = set()
+    return result
 
 
 def apply_source_filter(where: str, params: list, source: str | None) -> tuple[str, list]:
@@ -1657,6 +1704,59 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
             else:
                 result = "Неизвестное действие. Используй: add, search, list, delete"
+
+        elif tool_name == "get_exchange_listings":
+            mode = tool_input.get("mode", "compare")
+            listings = fetch_exchange_listings()
+
+            if mode == "list":
+                exch = tool_input.get("exchange", "Binance")
+                coins = sorted(listings.get(exch, set()))
+                result = f"{exch}: {len(coins)} фьючерсных пар\n"
+                result += ", ".join(coins[:200])
+                if len(coins) > 200:
+                    result += f"\n... и ещё {len(coins) - 200}"
+            else:
+                bnc = listings.get("Binance", set())
+                bbt = listings.get("Bybit", set())
+                okx = listings.get("OKX", set())
+                all_coins = bnc | bbt | okx
+
+                result = f"Всего уникальных монет: {len(all_coins)}\n"
+                result += f"Binance: {len(bnc)} | Bybit: {len(bbt)} | OKX: {len(okx)}\n\n"
+
+                only_bnc = sorted(bnc - bbt - okx)
+                only_bbt = sorted(bbt - bnc - okx)
+                only_okx = sorted(okx - bnc - bbt)
+                bnc_bbt = sorted((bnc & bbt) - okx)
+                bnc_okx = sorted((bnc & okx) - bbt)
+                bbt_okx = sorted((bbt & okx) - bnc)
+                all_three = sorted(bnc & bbt & okx)
+
+                result += f"На всех 3 биржах: {len(all_three)} монет\n"
+                result += f"Binance + Bybit (нет OKX): {len(bnc_bbt)}\n"
+                result += f"Binance + OKX (нет Bybit): {len(bnc_okx)}\n"
+                result += f"Bybit + OKX (нет Binance): {len(bbt_okx)}\n\n"
+
+                result += f"ТОЛЬКО Binance ({len(only_bnc)}):\n"
+                for c_name in only_bnc:
+                    result += f"  {c_name}\n"
+                result += f"\nТОЛЬКО Bybit ({len(only_bbt)}):\n"
+                for c_name in only_bbt:
+                    result += f"  {c_name}\n"
+                result += f"\nТОЛЬКО OKX ({len(only_okx)}):\n"
+                for c_name in only_okx:
+                    result += f"  {c_name}\n"
+
+                result += f"\nBinance + Bybit, нет на OKX ({len(bnc_bbt)}):\n"
+                for c_name in bnc_bbt:
+                    result += f"  {c_name}\n"
+                result += f"\nBinance + OKX, нет на Bybit ({len(bnc_okx)}):\n"
+                for c_name in bnc_okx:
+                    result += f"  {c_name}\n"
+                result += f"\nBybit + OKX, нет на Binance ({len(bbt_okx)}):\n"
+                for c_name in bbt_okx:
+                    result += f"  {c_name}\n"
 
     except Exception as e:
         result = f"Ошибка запроса: {e}"
