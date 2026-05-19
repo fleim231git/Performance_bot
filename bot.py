@@ -963,56 +963,44 @@ def parse_dt(dt_str: str, end_of_day: bool = False) -> str:
 
 
 def fetch_exchange_listings() -> dict[str, set[str]]:
-    import httpx
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    import httpx, time
+    headers = {"User-Agent": "Mozilla/5.0"}
     result = {}
 
-    # Binance — пробуем несколько эндпоинтов
-    for url in ["https://fapi.binance.com/fapi/v1/exchangeInfo", "https://fapi.binance.me/fapi/v1/exchangeInfo"]:
-        try:
-            r = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
-            if r.status_code == 200:
-                symbols = r.json().get("symbols", [])
-                result["Binance"] = {s["symbol"] for s in symbols if s.get("contractType") == "PERPETUAL" and s.get("status") == "TRADING"}
-                logger.info(f"Binance listings: {len(result['Binance'])} from {url}")
-                break
-        except Exception as e:
-            logger.error(f"Binance API error ({url}): {e}")
-    if "Binance" not in result:
-        result["Binance"] = set()
+    EXCHANGE_IDS = {
+        "Binance": "binance_futures",
+        "Bybit": "bybit",
+        "OKX": "okex_swap",
+    }
 
-    # Bybit — пагинация через cursor
-    bybit_coins = set()
-    cursor = ""
-    for _ in range(5):
+    for name, cg_id in EXCHANGE_IDS.items():
         try:
-            url = f"https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000"
-            if cursor:
-                url += f"&cursor={cursor}"
-            r = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
+            r = httpx.get(
+                f"https://api.coingecko.com/api/v3/derivatives/exchanges/{cg_id}",
+                params={"include_tickers": "unexpired"},
+                headers=headers, timeout=20
+            )
+            if r.status_code == 429:
+                logger.warning(f"CoinGecko rate limit on {name}")
+                result[name] = set()
+                time.sleep(2)
+                continue
             if r.status_code != 200:
-                break
-            data = r.json().get("result", {})
-            items = data.get("list", [])
-            bybit_coins |= {i["symbol"] for i in items if i.get("status") == "Trading"}
-            cursor = data.get("nextPageCursor", "")
-            if not cursor or not items:
-                break
+                logger.error(f"CoinGecko {name}: status {r.status_code}")
+                result[name] = set()
+                continue
+            tickers = r.json().get("tickers", [])
+            coins = set()
+            for t in tickers:
+                if t.get("contract_type") == "perpetual" and "USDT" in t.get("symbol", ""):
+                    symbol = t["symbol"].replace("/", "").replace(":USDT", "")
+                    coins.add(symbol.upper())
+            result[name] = coins
+            logger.info(f"{name} listings via CoinGecko: {len(coins)}")
+            time.sleep(1)
         except Exception as e:
-            logger.error(f"Bybit API error: {e}")
-            break
-    result["Bybit"] = bybit_coins
-    logger.info(f"Bybit listings: {len(bybit_coins)}")
-
-    # OKX
-    try:
-        r = httpx.get("https://www.okx.com/api/v5/public/instruments?instType=SWAP", headers=headers, timeout=15, follow_redirects=True)
-        items = r.json().get("data", [])
-        result["OKX"] = {i["instId"].replace("-USDT-SWAP", "USDT") for i in items if "USDT" in i.get("instId", "") and i.get("state") == "live"}
-        logger.info(f"OKX listings: {len(result['OKX'])}")
-    except Exception as e:
-        logger.error(f"OKX API error: {e}")
-        result["OKX"] = set()
+            logger.error(f"CoinGecko {name} error: {e}")
+            result[name] = set()
 
     return result
 
