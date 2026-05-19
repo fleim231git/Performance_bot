@@ -1231,9 +1231,9 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
             result += f"\nИТОГО В СПИСКЕ: {total_coins} монет\n"
 
             if is_stat:
-                # Дельта-разбивка для каждой монеты в топе
+                # Дельта-разбивка: топ-5 комбинаций на монету, макс 10 монет
                 result += "\nДЕЛЬТЫ ПО МОНЕТАМ:\n"
-                for coin_r, pnl_r, cnt_r, dist_r, dmin_r, dmax_r, buf_r, wins_r, spct_r in rows:
+                for coin_r, pnl_r, cnt_r, dist_r, dmin_r, dmax_r, buf_r, wins_r, spct_r in rows[:10]:
                     min_h = max(1, min(5, cnt_r // 20))
                     c.execute(f"""SELECT distance,
                         CAST(delta_min AS INTEGER) || '-' || CAST(delta_max AS INTEGER) as dr,
@@ -1242,18 +1242,14 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
                         FROM trades {where_base} AND coin=? AND delta_min IS NOT NULL
                         GROUP BY distance, CAST(delta_min AS INTEGER), CAST(delta_max AS INTEGER)
                         HAVING COUNT(*) >= {min_h}
-                        ORDER BY SUM(profit_pct) DESC""", params + [coin_r])
+                        ORDER BY SUM(profit_pct) DESC LIMIT 8""", params + [coin_r])
                     d_rows = c.fetchall()
                     if d_rows:
-                        from itertools import groupby as igroupby
                         result += f"\n#{coin_r} (ROE {'+' if (spct_r or 0)>=0 else ''}{(spct_r or 0):.1f}% суммарно):\n"
-                        sorted_d = sorted(d_rows, key=lambda x: x[0] or 0)
-                        for dist_val, group in igroupby(sorted_d, key=lambda x: x[0]):
-                            gl = sorted(list(group), key=lambda x: x[3] or 0, reverse=True)
-                            for _, dr, cnt_d, pct_d, wins_d in gl:
-                                dwr = round((wins_d or 0)/cnt_d*100 if cnt_d > 0 else 0, 1)
-                                icon = "🟢" if (pct_d or 0) >= 0 else "🔴"
-                                result += f"  {icon} dist={fmt_dist(dist_val)} δ{dr}%: ROE {'+' if (pct_d or 0)>=0 else ''}{(pct_d or 0):.1f}% | WR {dwr}% | {cnt_d} сделок\n"
+                        for dist_v, dr, cnt_d, pct_d, wins_d in d_rows:
+                            dwr = round((wins_d or 0)/cnt_d*100 if cnt_d > 0 else 0, 1)
+                            icon = "🟢" if (pct_d or 0) >= 0 else "🔴"
+                            result += f"  {icon} dist={fmt_dist(dist_v)} δ{dr}%: ROE {'+' if (pct_d or 0)>=0 else ''}{(pct_d or 0):.1f}% | WR {dwr}% | {cnt_d} сделок\n"
                     else:
                         result += f"\n#{coin_r}: нет данных с дельтами\n"
             else:
@@ -1666,6 +1662,8 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
     finally:
         conn.close()
 
+    if len(result) > 15000:
+        result = result[:15000] + "\n... (данные обрезаны, слишком большой объём)"
     return result
 
 
