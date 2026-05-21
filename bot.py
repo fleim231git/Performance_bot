@@ -2761,32 +2761,120 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-def build_daily_report() -> str:
-    now = datetime.now()
-    today = now.replace(hour=0, minute=0, second=0).isoformat()
-    week_ago = (now - timedelta(days=7)).isoformat()
+def get_top_coins_for_report(since: str, exchange: str, source: str, limit: int = 5) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    pnl_col = "profit_usd" if source == "live" else "profit_pct"
+    c.execute(f'''
+        SELECT coin, SUM({pnl_col}), COUNT(*),
+               SUM(CASE WHEN is_profit=1 THEN 1 ELSE 0 END)
+        FROM trades
+        WHERE timestamp >= ? AND exchange = ? AND source = ?
+        GROUP BY coin
+        HAVING SUM({pnl_col}) > 0
+        ORDER BY SUM({pnl_col}) DESC
+        LIMIT ?
+    ''', (since, exchange, source, limit))
+    rows = c.fetchall()
 
-    r = f"📊 *ДНЕВНОЙ ОТЧЁТ* | {now.strftime('%d.%m.%Y')}\n{'─'*25}\n\n"
-    r += "📅 *СЕГОДНЯ*\n"
-    r += get_stats_for_period(today)
-    r += f"\n{'─'*25}\n📅 *НЕДЕЛЯ*\n"
-    r += get_stats_for_period(week_ago)
+    if not rows:
+        conn.close()
+        return "  Нет данных\n"
+
+    r = ""
+    for i, (coin, pnl, cnt, wins) in enumerate(rows, 1):
+        wr = round((wins or 0) / cnt * 100, 1) if cnt > 0 else 0
+
+        # Лучший дистанс: с максимальным суммарным профитом
+        c.execute(f'''
+            SELECT distance, SUM({pnl_col})
+            FROM trades
+            WHERE timestamp >= ? AND exchange = ? AND source = ? AND coin = ?
+              AND distance > 0 AND distance IS NOT NULL
+            GROUP BY distance
+            ORDER BY SUM({pnl_col}) DESC
+            LIMIT 1
+        ''', (since, exchange, source, coin))
+        best_row = c.fetchone()
+
+        # Диапазон прибыльных дистансов
+        c.execute('''
+            SELECT MIN(distance), MAX(distance)
+            FROM trades
+            WHERE timestamp >= ? AND exchange = ? AND source = ? AND coin = ?
+              AND distance > 0 AND distance IS NOT NULL AND is_profit = 1
+        ''', (since, exchange, source, coin))
+        dist_range = c.fetchone()
+
+        pnl_str = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
+        pnl_fmt = f"{pnl_str}$" if source == "live" else f"ROE {pnl_str}%"
+
+        dist_str = ""
+        if best_row and best_row[0]:
+            best_d = best_row[0]
+            dist_str = f" | 🎯{best_d:.2f}%"
+            if dist_range and dist_range[0] and dist_range[1]:
+                dmin, dmax = dist_range[0], dist_range[1]
+                if abs(dmax - dmin) >= 0.01:
+                    dist_str += f" ({dmin:.2f}%–{dmax:.2f}%)"
+
+        r += f"{i}. #{coin} {pnl_fmt}{dist_str} | {cnt} сделок | WR {wr}%\n"
+
+    conn.close()
     return r
 
 
+def build_daily_report() -> str:
+    now = datetime.now()
+    today = now.replace(hour=0, minute=0, second=0).isoformat()
+
+    r = f"📊 *ДНЕВНОЙ ОТЧЁТ* | {now.strftime('%d.%m.%Y')}\n{'─'*25}\n\n"
+
+    r += "🏆 *ТОП МОНЕТ — РЕАЛЬНЫЕ ТОРГИ*\n\n"
+    for exch in ['Binance', 'Bybit', 'OKX']:
+        r += f"🏦 *{exch}*\n"
+        r += get_top_coins_for_report(today, exch, source='live', limit=5)
+        r += "\n"
+
+    r += f"{'─'*25}\n"
+    r += "📈 *ТОП МОНЕТ — СТАТИСТИКА (ROE)*\n\n"
+    for exch in ['Binance', 'Bybit', 'OKX']:
+        r += f"🏦 *{exch}*\n"
+        r += get_top_coins_for_report(today, exch, source='stat', limit=5)
+        r += "\n"
+
+    return r
+
+
+async def _send_daily_report(app: Application):
+    try:
+        await app.bot.send_message(
+            chat_id=REPORT_CHAT_ID,
+            text=build_daily_report(),
+            parse_mode="Markdown",
+            message_thread_id=REPORT_THREAD_ID
+        )
+    except Exception as e:
+        logger.error(f"Daily report error: {e}")
+
+
 async def scheduled_reports_loop(app: Application):
-    sent_daily = None; sent_weekly = None
+    sent_daily = None
+    sent_weekly = None
+
+    # Catchup: если бот перезапустился после 20:00 — сразу отправить
+    now = datetime.now()
+    if now.hour >= 20:
+        sent_daily = await _catchup_report(app, now.date(), sent_daily)
+
     while True:
         now      = datetime.now()
         day_key  = now.date()
         week_key = (now.isocalendar()[1], now.year)
-        if now.hour == 20 and now.minute == 0:
+        if now.hour == 20 and now.minute < 5:
             if sent_daily != day_key:
-                try:
-                    await app.bot.send_message(chat_id=REPORT_CHAT_ID, text=build_daily_report(), parse_mode="Markdown", message_thread_id=REPORT_THREAD_ID)
-                    sent_daily = day_key
-                except Exception as e:
-                    logger.error(f"Daily report error: {e}")
+                await _send_daily_report(app)
+                sent_daily = day_key
             if now.weekday() == 6 and sent_weekly != week_key:
                 try:
                     since = (now - timedelta(days=7)).isoformat()
@@ -2795,6 +2883,13 @@ async def scheduled_reports_loop(app: Application):
                 except Exception as e:
                     logger.error(f"Weekly report error: {e}")
         await asyncio.sleep(60)
+
+
+async def _catchup_report(app, day_key, sent_daily):
+    if sent_daily != day_key:
+        await _send_daily_report(app)
+        return day_key
+    return sent_daily
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
