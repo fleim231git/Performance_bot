@@ -796,23 +796,23 @@ def fmt_dist(d: float | None) -> str:
 def fmt_dist_info(dist_data: dict | None) -> str:
     if not dist_data:
         return ""
-    bp = dist_data.get("best_profit")
-    bc = dist_data.get("best_cnt", 0)
-    bwr = dist_data.get("best_wr", 0)
+    bp    = dist_data.get("best_profit")
+    bc    = dist_data.get("best_cnt", 0)
+    bwr   = dist_data.get("best_wr", 0)
     is_stat = dist_data.get("is_stat", False)
 
-    if dist_data.get("smart"):
-        line = (f" ⚡️{fmt_dist(dist_data['working'])} 🛡{fmt_dist(dist_data['insurance'])}"
-                f" ({fmt_dist(dist_data['min'])}–{fmt_dist(dist_data['max'])})")
-    else:
-        line = f" 🎯{fmt_dist(dist_data['avg'])} ({fmt_dist(dist_data['min'])}–{fmt_dist(dist_data['max'])})"
+    best_d = dist_data.get("working") or dist_data.get("avg")
+    dmin, dmax = dist_data.get("min"), dist_data.get("max")
+
+    line = f" 🎯{fmt_dist(best_d)}"
+    if dmin and dmax and abs(dmax - dmin) >= 0.01:
+        line += f" ({fmt_dist(dmin)}–{fmt_dist(dmax)})"
 
     if bp is not None and bc >= 2:
-        best_d = dist_data.get("working") or dist_data.get("best_dist") or dist_data.get("avg")
         if is_stat:
-            line += f" | 💰best={fmt_dist(best_d)} ROE {'+' if bp>=0 else ''}{bp:.1f}% WR {bwr}%"
+            line += f" 💰ROE {'+' if bp>=0 else ''}{bp:.1f}% WR {bwr}%"
         else:
-            line += f" | 💰best={fmt_dist(best_d)} {'+' if bp>=0 else ''}{bp:.2f}$ WR {bwr}%"
+            line += f" 💰{'+' if bp>=0 else ''}{bp:.2f}$ WR {bwr}%"
     return line
 
 
