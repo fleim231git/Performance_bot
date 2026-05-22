@@ -678,6 +678,7 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - "список монет на OKX" → mode="list", exchange="OKX"
 - "акции на Binance", "токенизированные акции", "металлы", "gold futures", "плечи на акции" → mode="equity"
 - mode="equity" — берёт данные напрямую с Binance Futures API, показывает ВСЕ нон-крипто инструменты: акции, металлы, товары, индексы
+- ВАЖНО: если mode="equity" вернул BINANCE_GEO_BLOCKED или BINANCE_API_ERROR — НЕМЕДЛЕННО (без вопросов пользователю) вызывай web_search с запросом о Binance equity/stock futures. НЕ спрашивай "хочешь поищу?" — просто делай web_search автоматически
 - Данные берутся напрямую с API бирж (Binance, Bybit, OKX) — актуальные
 - НЕ используй базу сделок для этих вопросов — база содержит только монеты по которым были сделки
 
@@ -1022,8 +1023,17 @@ def fetch_binance_equity_futures() -> str:
     }
     try:
         r = httpx.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15)
+        if r.status_code == 451:
+            return (
+                "BINANCE_GEO_BLOCKED: API недоступен по геолокации (ошибка 451). "
+                "Необходимо выполнить web_search для получения актуального списка. "
+                "Запрос для поиска: 'Binance Futures equity stock perpetual contracts list 2025 TSLAUSDT leveraged tokens'"
+            )
         if r.status_code != 200:
-            return f"Binance API вернул статус {r.status_code}."
+            return (
+                f"BINANCE_API_ERROR: статус {r.status_code}. "
+                "Выполни web_search для получения актуального списка инструментов."
+            )
         symbols = r.json().get("symbols", [])
         groups: dict[str, list] = {}
         for s in symbols:
@@ -1046,7 +1056,10 @@ def fetch_binance_equity_futures() -> str:
         out += "⚡️ Плечо: акции обычно до 5x, металлы — проверяй на binance.com/futures"
         return out
     except Exception as e:
-        return f"Ошибка запроса Binance Futures API: {e}"
+        return (
+            f"BINANCE_API_ERROR: {e}. "
+            "Выполни web_search для получения актуального списка инструментов."
+        )
 
 
 def apply_source_filter(where: str, params: list, source: str | None) -> tuple[str, list]:
