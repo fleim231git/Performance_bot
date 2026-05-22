@@ -2017,6 +2017,9 @@ async def claude_reply(user_id: int, user_text: str) -> str:
         'залистили', 'залистил', 'листинг', 'listing', 'делистинг',
         'что за монет', 'что это за монет', 'что за токен', 'что за проект',
         'когда добавили', 'новая монета', 'новый токен',
+        # токенизированные акции, плечи, etf
+        'акци', 'токенизир', 'tokenized', 'stock', 'etf', 'плечи', 'плечо',
+        'leverage', 'leveraged', 'леверидж', 'leveraged token',
     ]
     needs_web_search = any(kw in user_text.lower() for kw in WEB_SEARCH_KEYWORDS)
 
@@ -2161,7 +2164,7 @@ async def claude_reply(user_id: int, user_text: str) -> str:
                 logger.error(f"Fallback web search error: {fb_e}")
 
     except Exception as e:
-        logger.error(f"Claude API error: {e}")
+        logger.exception(f"Claude API error: {e}")
         reply = "⚠️ Ошибка при обращении к Claude. Попробуй позже."
         history.append({"role": "assistant", "content": reply})
         return reply
