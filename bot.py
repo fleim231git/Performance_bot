@@ -676,6 +676,8 @@ SYSTEM_PROMPT = """Ты — аналитический ассистент тре
 - Используй get_exchange_listings когда спрашивают про наличие монет на биржах
 - "какие монеты есть на Binance но нет на Bybit" → mode="compare"
 - "список монет на OKX" → mode="list", exchange="OKX"
+- "акции на Binance", "токенизированные акции", "металлы", "gold futures", "плечи на акции" → mode="equity"
+- mode="equity" — берёт данные напрямую с Binance Futures API, показывает ВСЕ нон-крипто инструменты: акции, металлы, товары, индексы
 - Данные берутся напрямую с API бирж (Binance, Bybit, OKX) — актуальные
 - НЕ используй базу сделок для этих вопросов — база содержит только монеты по которым были сделки
 
@@ -939,11 +941,16 @@ TOOLS = [
     # ─── EXCHANGE LISTINGS ────────────────────────────────────────────────────
     {
         "name": "get_exchange_listings",
-        "description": "Получить списки фьючерсных монет с бирж Binance/Bybit/OKX и сравнить. Показывает какие монеты есть на одной бирже но нет на других.",
+        "description": (
+            "Получить списки фьючерсных монет с бирж Binance/Bybit/OKX и сравнить. "
+            "mode=compare — уникальные монеты по биржам (крипто). "
+            "mode=list — все монеты конкретной биржи (крипто). "
+            "mode=equity — АКЦИИ, МЕТАЛЛЫ и нон-крипто перпы на Binance Futures (токенизированные акции, gold, silver и т.д.)."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "mode": {"type": "string", "enum": ["compare", "list"], "description": "compare = сравнить биржи и показать уникальные монеты. list = показать все монеты конкретной биржи"},
+                "mode": {"type": "string", "enum": ["compare", "list", "equity"], "description": "compare = сравнить биржи. list = список монет биржи. equity = акции/металлы/нон-крипто перпы Binance"},
                 "exchange": {"type": "string", "description": "Биржа для mode=list (Binance, Bybit, OKX)"}
             },
             "required": ["mode"]
@@ -1003,6 +1010,43 @@ def fetch_exchange_listings() -> dict[str, set[str]]:
             result[name] = set()
 
     return result
+
+
+def fetch_binance_equity_futures() -> str:
+    """Получает нон-крипто перпы с Binance Futures: акции, металлы, товары."""
+    import httpx
+    TYPE_LABELS = {
+        "STOCK":     "📈 Акции (Stock perpetuals)",
+        "COMMODITY": "🥇 Металлы / Товары",
+        "INDEX":     "📊 Индексы",
+    }
+    try:
+        r = httpx.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15)
+        if r.status_code != 200:
+            return f"Binance API вернул статус {r.status_code}."
+        symbols = r.json().get("symbols", [])
+        groups: dict[str, list] = {}
+        for s in symbols:
+            if s.get("status") != "TRADING" or s.get("contractType") != "PERPETUAL":
+                continue
+            ut = s.get("underlyingType", "")
+            if ut == "COIN":
+                continue
+            groups.setdefault(ut, []).append((s["symbol"], s.get("baseAsset", "")))
+        if not groups:
+            return "Нон-крипто инструментов на Binance Futures не найдено."
+        total = sum(len(v) for v in groups.values())
+        out = f"📋 Нон-крипто перпы Binance Futures ({total} инструментов):\n\n"
+        for ut, items in sorted(groups.items()):
+            label = TYPE_LABELS.get(ut, f"📌 {ut}")
+            out += f"{label} — {len(items)} шт.:\n"
+            for sym, base in sorted(items):
+                out += f"  • {sym}" + (f"  ({base})" if base and base not in sym else "") + "\n"
+            out += "\n"
+        out += "⚡️ Плечо: акции обычно до 5x, металлы — проверяй на binance.com/futures"
+        return out
+    except Exception as e:
+        return f"Ошибка запроса Binance Futures API: {e}"
 
 
 def apply_source_filter(where: str, params: list, source: str | None) -> tuple[str, list]:
@@ -1723,16 +1767,19 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
 
         elif tool_name == "get_exchange_listings":
             mode = tool_input.get("mode", "compare")
-            listings = fetch_exchange_listings()
 
-            if mode == "list":
+            if mode == "equity":
+                result = fetch_binance_equity_futures()
+            elif mode == "list":
+                listings = fetch_exchange_listings()
                 exch = tool_input.get("exchange", "Binance")
                 coins = sorted(listings.get(exch, set()))
                 result = f"{exch}: {len(coins)} фьючерсных пар\n"
                 result += ", ".join(coins[:200])
                 if len(coins) > 200:
                     result += f"\n... и ещё {len(coins) - 200}"
-            else:
+            else:  # compare
+                listings = fetch_exchange_listings()
                 bnc = listings.get("Binance", set())
                 bbt = listings.get("Bybit", set())
                 okx = listings.get("OKX", set())
